@@ -15,6 +15,7 @@
 #include <map>
 #include <deque>
 #include <numeric>
+#include <cmath>
 #if !defined(ARDUINO)
 #include <thread>
 #endif
@@ -138,6 +139,22 @@ struct AckNotification {
   uint8_t reportedWindow = 0;          // размер окна, который видел получатель
 };
 
+// --- Диагностика и настройки длинных окон приёма ---
+struct RxTimingDiagnostics {
+  uint16_t preambleSymbols = static_cast<uint16_t>(kRadioDefaults.preambleLength); // текущая длина преамбулы
+  uint32_t rxTimeoutSymbols = 0;                  // установленный тайм-аут в символах (0 = бесконечный)
+  uint16_t symbTimeout = 0;                       // ограничение LoRaSymbNumTimeout, если поддерживается
+  bool stopTimerOnPreamble = false;               // активирован ли StopRxTimerOnPreamble
+  bool forceContinuousRx = true;                  // временно держим приёмник в бесконечном SetRx для диагностики
+  bool rxContinuous = false;                      // удалось ли перевести в непрерывный режим
+  bool ldroForced = false;                        // включена ли принудительная оптимизация LDRO
+  unsigned long lastSetRxMs = 0;                  // отметка времени последнего SetRx
+  bool reportedMissingStopTimerSupport = false;   // уже сообщали об отсутствии API StopRxTimerOnPreamble
+  bool reportedMissingRxTimeoutSupport = false;   // уже сообщали об отсутствии API установки тайм-аута
+  bool reportedMissingSymbTimeoutSupport = false; // уже сообщали об отсутствии API SymbNumTimeout
+  bool reportedMissingLdroSupport = false;        // уже сообщали об отсутствии API принудительного LDRO
+};
+
 struct AppState {
   uint8_t channelIndex = 0;            // выбранный канал банка HOME
   bool highPower = false;              // признак использования мощности 22 dBm (иначе -5 dBm)
@@ -151,6 +168,9 @@ struct AppState {
   RxWindowState rxWindow;              // состояние окна приёма
   RxMessageState rxMessage;            // состояние сборки сообщения
   AckNotification pendingAck;          // последнее полученное подтверждение
+  float radioBandwidthKhz = kDefaultBandwidthKhz; // активная полоса пропускания
+  uint8_t currentSpreadingFactor = kDefaultSpreadingFactor; // фактический SF
+  RxTimingDiagnostics rxTiming;        // состояние тайминговых оптимизаций
 } state;
 
 // --- Флаги приёма LoRa ---
@@ -221,6 +241,52 @@ int16_t clearIrqFlags(Radio& radio, uint32_t mask) {
 
 } // namespace radiolib_compat
 
+// --- Проверки наличия специфичных методов RadioLib для настройки таймингов ---
+namespace radiolib_features {
+
+template <typename T, typename = void>
+struct HasSetStopRxTimerOnPreamble : std::false_type {};
+
+template <typename T>
+struct HasSetStopRxTimerOnPreamble<
+    T,
+    std::void_t<decltype(std::declval<T&>().setStopRxTimerOnPreamble(true))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasSetRxTimeoutSymbols : std::false_type {};
+
+template <typename T>
+struct HasSetRxTimeoutSymbols<
+    T,
+    std::void_t<decltype(std::declval<T&>().setRxTimeout(static_cast<uint32_t>(0)))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasSetRxTimeoutSeconds : std::false_type {};
+
+template <typename T>
+struct HasSetRxTimeoutSeconds<
+    T,
+    std::void_t<decltype(std::declval<T&>().setRxTimeout(0.0f))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasSetLoRaSymbNumTimeout : std::false_type {};
+
+template <typename T>
+struct HasSetLoRaSymbNumTimeout<
+    T,
+    std::void_t<decltype(std::declval<T&>().setLoRaSymbNumTimeout(static_cast<uint8_t>(0)))>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasSetLowDataRateOptimization : std::false_type {};
+
+template <typename T>
+struct HasSetLowDataRateOptimization<
+    T,
+    std::void_t<decltype(std::declval<T&>().setLowDataRateOptimization(true))>> : std::true_type {};
+
+} // namespace radiolib_features
+
 // --- Вспомогательные функции объявления ---
 void IRAM_ATTR onRadioDio1Rise();
 String formatSx1262IrqFlags(uint32_t flags);
@@ -286,6 +352,8 @@ void handleSpreadingFactorToggle();
 void waitInterFrameDelay();
 String formatByteArray(const std::vector<uint8_t>& data);
 String formatTextPayload(const std::vector<uint8_t>& data);
+void configureNarrowbandRxOptions();
+void logRxTimingEvent(const String& message);
 
 // --- Формирование имени Wi-Fi сети ---
 String makeAccessPointSsid() {
@@ -350,9 +418,19 @@ void setup() {
 
     // Применяем настройки LoRa согласно требованиям задачи
     state.useSf5 = (kDefaultSpreadingFactor == 5);
-    applySpreadingFactor(state.useSf5);
-    radio.setBandwidth(kDefaultBandwidthKhz);
-    radio.setCodingRate(kDefaultCodingRate);
+    if (!applySpreadingFactor(state.useSf5)) {
+      addEvent("Не удалось применить стартовый SF — используем параметры по умолчанию");
+    }
+    int16_t bwState = radio.setBandwidth(kDefaultBandwidthKhz);
+    if (bwState != RADIOLIB_ERR_NONE) {
+      logRadioError("setBandwidth", bwState);
+    } else {
+      state.radioBandwidthKhz = kDefaultBandwidthKhz;
+    }
+    int16_t crState = radio.setCodingRate(kDefaultCodingRate);
+    if (crState != RADIOLIB_ERR_NONE) {
+      logRadioError("setCodingRate", crState);
+    }
 
     radio.setDio2AsRfSwitch(kRadioDefaults.useDio2AsRfSwitch);
     if (kRadioDefaults.useDio3ForTcxo && kRadioDefaults.tcxoVoltage > 0.0f) {
@@ -365,9 +443,16 @@ void setup() {
     }
     radio.setCRC(kRadioDefaults.enableCrc ? 2 : 0);          // длина CRC в байтах: 2 либо 0
     radio.invertIQ(kRadioDefaults.invertIq);                 // включаем или выключаем инверсию IQ
-    radio.setPreambleLength(kRadioDefaults.preambleLength);
+    int16_t preambleState = radio.setPreambleLength(kRadioDefaults.preambleLength);
+    if (preambleState != RADIOLIB_ERR_NONE) {
+      logRadioError("setPreambleLength", preambleState);
+    } else {
+      state.rxTiming.preambleSymbols = kRadioDefaults.preambleLength;
+    }
     radio.setRxBoostedGainMode(kRadioDefaults.rxBoostedGain); // режим усиленного приёма SX1262
     radio.setSyncWord(kRadioDefaults.syncWord);
+
+    configureNarrowbandRxOptions();
 
     if (!applyRadioChannel(state.channelIndex)) {
       addEvent("Ошибка инициализации канала — проверьте модуль SX1262");
@@ -428,7 +513,12 @@ void processRadioEvents() {
   if (processIrq) {
     const uint32_t irqFlags = radiolib_compat::readIrqFlags(radio);   // считываем активные флаги независимо от версии API
     radiolib_compat::clearIrqFlags(radio, RADIOLIB_SX126X_IRQ_ALL);   // сбрасываем регистр IRQ в доступном варианте
-    addEvent(formatSx1262IrqFlags(irqFlags));                         // публикуем расшифровку событий
+    String irqMessage = formatSx1262IrqFlags(irqFlags);               // публикуем расшифровку событий с таймингом
+    if (state.rxTiming.lastSetRxMs != 0) {
+      const unsigned long delta = millis() - state.rxTiming.lastSetRxMs;
+      irqMessage += String(" | прошло ") + String(delta) + " мс с последнего SetRx";
+    }
+    logRxTimingEvent(irqMessage);
   }
 
   if (!packetReceivedFlag) {
@@ -556,6 +646,13 @@ void appendEventBuffer(const String& message, unsigned long id, const String& co
   if (state.events.size() > kMaxEventHistory) {
     state.events.erase(state.events.begin());
   }
+}
+
+// --- Логирование тайминговых событий RX с отметкой времени ---
+void logRxTimingEvent(const String& message) {
+  const unsigned long now = millis();
+  String formatted = String("[RX t=") + String(now) + F(" мс] ") + message;
+  addEvent(formatted);
 }
 
 // --- HTML главной страницы ---
@@ -878,6 +975,137 @@ bool applyRadioChannel(uint8_t newIndex) {
 }
 
 // --- Настройка мощности передачи ---
+// --- Настройка длительного окна приёма для узкой полосы ---
+void configureNarrowbandRxOptions() {
+  const float bandwidthKhz = state.radioBandwidthKhz;
+  const uint8_t sf = state.currentSpreadingFactor;
+  const float bandwidthHz = bandwidthKhz * 1000.0f;
+  const float symbolDurationMs =
+      (bandwidthHz > 0.0f) ? (static_cast<float>(1UL << sf) / bandwidthHz) * 1000.0f : 0.0f;
+  const bool narrowBandwidth = (bandwidthKhz <= 10.0f);
+  const bool veryNarrowBandwidth = (bandwidthKhz <= 8.0f);
+
+  uint16_t targetPreamble = state.rxTiming.preambleSymbols;
+  if (veryNarrowBandwidth) {
+    targetPreamble = std::max<uint16_t>(targetPreamble, static_cast<uint16_t>(24));
+  } else if (narrowBandwidth) {
+    targetPreamble = std::max<uint16_t>(targetPreamble, static_cast<uint16_t>(16));
+  }
+
+  if (targetPreamble != state.rxTiming.preambleSymbols) {
+    const int16_t code = radio.setPreambleLength(targetPreamble);
+    if (code == RADIOLIB_ERR_NONE) {
+      state.rxTiming.preambleSymbols = targetPreamble;
+      logRxTimingEvent(String("Преамбула увеличена до ") + String(targetPreamble) +
+                       String(" символов для BW=") + String(bandwidthKhz, 2) + " кГц");
+    } else {
+      logRadioError("setPreambleLength", code);
+    }
+  }
+
+  if constexpr (radiolib_features::HasSetStopRxTimerOnPreamble<SX1262>::value) {
+    const bool desiredStop = narrowBandwidth;
+    if (desiredStop != state.rxTiming.stopTimerOnPreamble) {
+      const int16_t code = radio.setStopRxTimerOnPreamble(desiredStop);
+      if (code == RADIOLIB_ERR_NONE) {
+        state.rxTiming.stopTimerOnPreamble = desiredStop;
+        logRxTimingEvent(String("StopRxTimerOnPreamble ") + (desiredStop ? "включён" : "выключен"));
+      } else {
+        logRadioError("setStopRxTimerOnPreamble", code);
+      }
+    }
+  } else if (narrowBandwidth && !state.rxTiming.reportedMissingStopTimerSupport) {
+    state.rxTiming.reportedMissingStopTimerSupport = true;
+    logRxTimingEvent(
+        F("RadioLib не поддерживает StopRxTimerOnPreamble — следим за таймерами вручную"));
+  }
+
+  const bool needLdro = (symbolDurationMs >= 16.0f);
+  if constexpr (radiolib_features::HasSetLowDataRateOptimization<SX1262>::value) {
+    if (needLdro != state.rxTiming.ldroForced) {
+      const int16_t code = radio.setLowDataRateOptimization(needLdro);
+      if (code == RADIOLIB_ERR_NONE) {
+        state.rxTiming.ldroForced = needLdro;
+        logRxTimingEvent(String("LDRO ") + (needLdro ? "включён" : "выключен") +
+                         String(" (Ts=") + String(symbolDurationMs, 2) + " мс)");
+      } else {
+        logRadioError("setLowDataRateOptimization", code);
+      }
+    }
+  } else if (needLdro && !state.rxTiming.reportedMissingLdroSupport) {
+    state.rxTiming.reportedMissingLdroSupport = true;
+    logRxTimingEvent(F("Нет API принудительного LDRO — убедитесь, что RadioLib активирует его сам"));
+  }
+
+  const bool needExtendedTimeout = narrowBandwidth || (symbolDurationMs >= 10.0f);
+  const bool useContinuous = needExtendedTimeout && state.rxTiming.forceContinuousRx;
+  const float targetWindowMs = 2000.0f + 150.0f; // 2 секунды окна + запас
+  uint32_t timeoutSymbols = 0;
+  if (symbolDurationMs > 0.0f) {
+    timeoutSymbols = static_cast<uint32_t>(std::ceil(targetWindowMs / symbolDurationMs));
+    if (timeoutSymbols == 0U) {
+      timeoutSymbols = 1U;
+    }
+  }
+
+  if constexpr (radiolib_features::HasSetRxTimeoutSymbols<SX1262>::value) {
+    const uint32_t applied = useContinuous ? 0U : timeoutSymbols;
+    if (applied != state.rxTiming.rxTimeoutSymbols) {
+      const int16_t code = radio.setRxTimeout(applied);
+      if (code == RADIOLIB_ERR_NONE) {
+        state.rxTiming.rxTimeoutSymbols = applied;
+        state.rxTiming.rxContinuous = useContinuous;
+        if (useContinuous) {
+          logRxTimingEvent(F("RX переведён в непрерывный режим (SetRx timeout=0)"));
+        } else {
+          const float timeoutSeconds = (symbolDurationMs * applied) / 1000.0f;
+          logRxTimingEvent(String("RX тайм-аут ≈ ") + String(timeoutSeconds, 2) + " с");
+        }
+      } else {
+        logRadioError("setRxTimeout", code);
+      }
+    }
+  } else if constexpr (radiolib_features::HasSetRxTimeoutSeconds<SX1262>::value) {
+    const float timeoutSeconds = useContinuous ? 0.0f : (symbolDurationMs * timeoutSymbols) / 1000.0f;
+    const bool shouldApply = useContinuous || needExtendedTimeout;
+    if (shouldApply) {
+      const int16_t code = radio.setRxTimeout(timeoutSeconds);
+      if (code == RADIOLIB_ERR_NONE) {
+        state.rxTiming.rxTimeoutSymbols = useContinuous ? 0U : timeoutSymbols;
+        state.rxTiming.rxContinuous = useContinuous;
+        if (useContinuous) {
+          logRxTimingEvent(F("RX переведён в непрерывный режим (SetRx timeout=0)"));
+        } else {
+          logRxTimingEvent(String("RX тайм-аут ≈ ") + String(timeoutSeconds, 2) + " с");
+        }
+      } else {
+        logRadioError("setRxTimeout", code);
+      }
+    }
+  } else if (needExtendedTimeout && !state.rxTiming.reportedMissingRxTimeoutSupport) {
+    state.rxTiming.reportedMissingRxTimeoutSupport = true;
+    logRxTimingEvent(F("RadioLib не даёт выставить RX тайм-аут — окно нужно держать вручную"));
+  }
+
+  if constexpr (radiolib_features::HasSetLoRaSymbNumTimeout<SX1262>::value) {
+    const uint16_t desired = static_cast<uint16_t>(std::min<uint32_t>(255U,
+                                                                      static_cast<uint32_t>(targetPreamble + 8U)));
+    if (desired != 0 && desired != state.rxTiming.symbTimeout) {
+      const int16_t code = radio.setLoRaSymbNumTimeout(static_cast<uint8_t>(desired));
+      if (code == RADIOLIB_ERR_NONE) {
+        state.rxTiming.symbTimeout = desired;
+        logRxTimingEvent(String("LoRaSymbNumTimeout установлен в ") + String(desired) + " символов");
+      } else {
+        logRadioError("setLoRaSymbNumTimeout", code);
+      }
+    }
+  } else if (narrowBandwidth && !state.rxTiming.reportedMissingSymbTimeoutSupport) {
+    state.rxTiming.reportedMissingSymbTimeoutSupport = true;
+    logRxTimingEvent(F("Нет доступа к LoRaSymbNumTimeout — оставляем поиск заголовка по умолчанию"));
+  }
+}
+
+// --- Настройка мощности передачи ---
 bool applyRadioPower(bool highPower) {
   int8_t targetDbm = highPower ? kHighPowerDbm : kLowPowerDbm;
   int16_t result = radio.setOutputPower(targetDbm);
@@ -897,6 +1125,8 @@ bool applySpreadingFactor(bool useSf5) {
     return false;
   }
   state.useSf5 = useSf5;
+  state.currentSpreadingFactor = targetSf;
+  configureNarrowbandRxOptions();
   return true;
 }
 
@@ -918,6 +1148,8 @@ bool ensureReceiveMode() {
     logRadioError("startReceive", stateCode);
     return false;
   }
+  state.rxTiming.lastSetRxMs = millis();
+  logRxTimingEvent(F("Команда SetRx отправлена (переход в ожидание пакета)"));
   return true;
 }
 
