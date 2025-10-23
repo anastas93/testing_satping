@@ -155,10 +155,22 @@ struct RxTimingDiagnostics {
   bool reportedMissingLdroSupport = false;        // уже сообщали об отсутствии API принудительного LDRO
 };
 
+struct FhssConfig {
+  bool enabled = false;                                  // включён ли программный FHSS
+  unsigned long dwellTimeMs = 250;                       // длительность стоянки на одном прыжке
+  std::array<uint8_t, kHomeBankSize> hopSequence{};      // последовательность каналов HOME для прыжков
+  size_t hopCount = 0;                                   // фактическое количество активных каналов в последовательности
+  size_t currentHopIndex = 0;                            // индекс текущего прыжка в массиве
+  size_t nextHopIndex = 0;                               // индекс следующего прыжка для передачи/приёма
+  uint8_t currentHopChannel = 0;                         // номер канала HOME, на котором сейчас работаем
+  uint8_t previousChannel = 0;                           // сохранённый «фиксированный» канал для возврата при выключении FHSS
+  unsigned long lastHopMillis = 0;                       // отметка времени последнего переключения частоты
+};
+
 struct AppState {
-  uint8_t channelIndex = 0;            // выбранный канал банка HOME
+  uint8_t channelIndex = 0;            // выбранный канал банка HOME (фиксированный режим)
   bool highPower = false;              // признак использования мощности 22 dBm (иначе -5 dBm)
-  bool useSf5 = false;                 // признак использования SF5 (false => SF7)
+  uint8_t selectedSpreadingFactor = kDefaultSpreadingFactor; // выбранный пользователем SF
   float currentRxFreq = frequency_tables::RX_HOME[0]; // текущая частота приёма
   float currentTxFreq = frequency_tables::TX_HOME[0]; // текущая частота передачи
   unsigned long nextEventId = 1;       // счётчик идентификаторов для событий
@@ -171,6 +183,7 @@ struct AppState {
   float radioBandwidthKhz = kDefaultBandwidthKhz; // активная полоса пропускания
   uint8_t currentSpreadingFactor = kDefaultSpreadingFactor; // фактический SF
   RxTimingDiagnostics rxTiming;        // состояние тайминговых оптимизаций
+  FhssConfig fhss;                     // параметры программного частотного прыжкового режима
 } state;
 
 // --- Флаги приёма LoRa ---
@@ -377,13 +390,16 @@ void handleSendRandomPacket();
 void handleSendCustom();
 void handleNotFound();
 void handleProtocolToggle();
+void handleSpreadingFactorChange();
+void handleFhssToggle();
 String buildIndexHtml();
 String buildChannelOptions(uint8_t selected);
 String escapeJson(const String& value);
 String makeAccessPointSsid();
 bool applyRadioChannel(uint8_t newIndex);
+bool tuneToHomeChannel(uint8_t newIndex, bool updateSelection);
 bool applyRadioPower(bool highPower);
-bool applySpreadingFactor(bool useSf5);
+bool applySpreadingFactor(uint8_t spreadingFactor);
 bool applyPhyFec(bool enable);
 bool ensureReceiveMode();
 void processRadioEvents();
@@ -424,7 +440,11 @@ uint8_t crc8Dallas(const uint8_t* data, size_t length);
 void resetReceiveState();
 void logReceivedMessage(const std::vector<uint8_t>& payload);
 void logRadioError(const String& context, int16_t code);
-void handleSpreadingFactorToggle();
+void initFhssDefaults();
+bool setFhssEnabled(bool enable);
+void updateFhss();
+bool applyFhssHopByIndex(size_t hopIndex);
+bool advanceFhssIfDue();
 void waitInterFrameDelay();
 String formatByteArray(const std::vector<uint8_t>& data);
 String formatTextPayload(const std::vector<uint8_t>& data);
@@ -465,6 +485,8 @@ void setup() {
   addEvent("Запуск устройства " LOTEST_PROJECT_NAME);
   randomSeed(esp_random());
 
+  initFhssDefaults();
+
   // Настройка SPI для радиомодуля SX1262
   radioSPI.begin(18, 19, 23, 5); // VSPI: SCK=18, MISO=19, MOSI=23, SS=5
 
@@ -493,8 +515,8 @@ void setup() {
     addEvent("Радиомодуль успешно инициализирован");
 
     // Применяем настройки LoRa согласно требованиям задачи
-    state.useSf5 = (kDefaultSpreadingFactor == 5);
-    if (!applySpreadingFactor(state.useSf5)) {
+    state.selectedSpreadingFactor = kDefaultSpreadingFactor;
+    if (!applySpreadingFactor(state.selectedSpreadingFactor)) {
       addEvent("Не удалось применить стартовый SF — используем параметры по умолчанию");
     }
     int16_t bwState = radio.setBandwidth(kDefaultBandwidthKhz);
@@ -559,7 +581,8 @@ void setup() {
   server.on("/api/send/long", HTTP_POST, handleSendLongPacket);
   server.on("/api/send/random", HTTP_POST, handleSendRandomPacket);
   server.on("/api/send/custom", HTTP_POST, handleSendCustom);
-  server.on("/api/sf", HTTP_POST, handleSpreadingFactorToggle);
+  server.on("/api/sf", HTTP_POST, handleSpreadingFactorChange);
+  server.on("/api/fhss", HTTP_POST, handleFhssToggle);
   server.on("/api/protocol", HTTP_POST, handleProtocolToggle);
   server.onNotFound(handleNotFound);
   server.begin();
@@ -570,6 +593,7 @@ void setup() {
 void loop() {
   server.handleClient();
   processRadioEvents();
+  updateFhss();
 }
 
 // --- Обработка радиособытий вне основного цикла ---
@@ -777,8 +801,24 @@ void handleChannelChange() {
     server.send(400, "application/json", "{\"error\":\"Недопустимый канал\"}");
     return;
   }
-  if (applyRadioChannel(static_cast<uint8_t>(channel))) {
-    state.channelIndex = static_cast<uint8_t>(channel);
+  const uint8_t newIndex = static_cast<uint8_t>(channel);
+  bool success = false;
+  if (state.fhss.enabled) {
+    state.channelIndex = newIndex;
+    state.fhss.previousChannel = newIndex;
+    size_t startIndex = 0;
+    for (size_t i = 0; i < state.fhss.hopCount; ++i) {
+      if (state.fhss.hopSequence[i] == newIndex) {
+        startIndex = i;
+        break;
+      }
+    }
+    success = applyFhssHopByIndex(startIndex);
+  } else {
+    success = applyRadioChannel(newIndex);
+  }
+
+  if (success) {
     addEvent(String("Выбран канал HOME #") + String(channel) + ", RX=" + String(state.currentRxFreq, 3) + " МГц, TX=" + String(state.currentTxFreq, 3) + " МГц");
     server.send(200, "application/json", "{\"ok\":true}");
   } else {
@@ -798,14 +838,39 @@ void handlePowerToggle() {
   }
 }
 
-// --- API: переключение фактора расширения ---
-void handleSpreadingFactorToggle() {
-  bool newSf5 = server.hasArg("sf5") && server.arg("sf5") == "1";
-  if (applySpreadingFactor(newSf5)) {
-    addEvent(String("Фактор расширения установлен: SF") + String(static_cast<unsigned long>(newSf5 ? 5 : kDefaultSpreadingFactor)));
+// --- API: установка фактора расширения ---
+void handleSpreadingFactorChange() {
+  if (!server.hasArg("sf")) {
+    server.send(400, "application/json", "{\"error\":\"Не указан параметр sf\"}");
+    return;
+  }
+
+  int requested = server.arg("sf").toInt();
+  if (requested < 5 || requested > 12) {
+    server.send(400, "application/json", "{\"error\":\"SF допустим в диапазоне 5-12\"}");
+    return;
+  }
+
+  if (applySpreadingFactor(static_cast<uint8_t>(requested))) {
+    addEvent(String("Фактор расширения установлен: SF") + String(requested));
     server.send(200, "application/json", "{\"ok\":true}");
   } else {
     server.send(500, "application/json", "{\"error\":\"Ошибка установки SF\"}");
+  }
+}
+
+// --- API: переключение программного FHSS ---
+void handleFhssToggle() {
+  bool enable = server.hasArg("enable") && server.arg("enable") == "1";
+  if (setFhssEnabled(enable)) {
+    if (enable) {
+      addEvent(String("FHSS включён, стартовый канал HOME #") + String(state.fhss.currentHopChannel));
+    } else {
+      addEvent(String("FHSS выключен, возвращаемся к каналу HOME #") + String(state.channelIndex));
+    }
+    server.send(200, "application/json", "{\"ok\":true}");
+  } else {
+    server.send(500, "application/json", "{\"error\":\"Не удалось переключить FHSS\"}");
   }
 }
 
@@ -936,11 +1001,20 @@ String buildIndexHtml() {
     html += " checked";
   }
   html += "> Мощность 22 dBm (выкл — -5 dBm)</label>";
-  html += "<label><input type='checkbox' id='sf5'";
-  if (state.useSf5) {
+  html += "<label>Фактор расширения:</label><select id='sf'>";
+  for (uint8_t sf = 5; sf <= 12; ++sf) {
+    html += "<option value='" + String(sf) + "'";
+    if (state.selectedSpreadingFactor == sf) {
+      html += " selected";
+    }
+    html += ">SF" + String(sf) + "</option>";
+  }
+  html += "</select>";
+  html += "<label><input type='checkbox' id='fhss'";
+  if (state.fhss.enabled) {
     html += " checked";
   }
-  html += "> Фактор расширения SF5 (выкл — SF7)</label>";
+  html += "> Программный FHSS</label>";
   html += F("<fieldset><legend>Надёжность</legend>");
   html += "<label><input type='checkbox' id='interleaving'";
   if (state.protocol.interleaving) {
@@ -971,14 +1045,15 @@ String buildIndexHtml() {
   html += F("</div></section>");
 
   html += F("<section><h2>Журнал событий</h2><div id='log'></div></section></main><script>");
-  html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfCb=document.getElementById('sf5');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const statusEl=document.getElementById('status');let lastId=0;");
+  html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfSelect=document.getElementById('sf');const fhssCb=document.getElementById('fhss');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const statusEl=document.getElementById('status');let lastId=0;");
   html += F("function appendLog(entry){const div=document.createElement('div');div.className='message';div.textContent=entry.text;if(entry.color){div.style.color=entry.color;}logEl.appendChild(div);logEl.scrollTop=logEl.scrollHeight;}");
   html += F("async function refreshLog(){try{const resp=await fetch(`/api/log?after=${lastId}`);if(!resp.ok)return;const data=await resp.json();data.events.forEach(evt=>{appendLog(evt);lastId=evt.id;});}catch(e){console.error(e);}}");
   html += F("async function postForm(url,body){const resp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(body)});if(!resp.ok){const err=await resp.json().catch(()=>({error:'Неизвестная ошибка'}));throw new Error(err.error||'Ошибка');}}");
   html += F("async function updateProtocol(field,value){const payload={};payload[field]=value?'1':'0';try{await postForm('/api/protocol',payload);statusEl.textContent='Настройки протокола обновлены';refreshLog();}catch(e){statusEl.textContent=e.message;}}");
   html += F("channelSel.addEventListener('change',async()=>{try{await postForm('/api/channel',{channel:channelSel.value});statusEl.textContent='Канал применён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("powerCb.addEventListener('change',async()=>{try{await postForm('/api/power',{high:powerCb.checked?'1':'0'});statusEl.textContent='Мощность обновлена';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
-  html += F("sfCb.addEventListener('change',async()=>{try{await postForm('/api/sf',{sf5:sfCb.checked?'1':'0'});statusEl.textContent='Фактор расширения обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
+  html += F("sfSelect.addEventListener('change',async()=>{try{await postForm('/api/sf',{sf:sfSelect.value});statusEl.textContent='Фактор расширения обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
+  html += F("fhssCb.addEventListener('change',async()=>{try{await postForm('/api/fhss',{enable:fhssCb.checked?'1':'0'});statusEl.textContent='Статус FHSS обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("interCb.addEventListener('change',()=>{updateProtocol('interleaving',interCb.checked);});");
   html += F("harqCb.addEventListener('change',()=>{updateProtocol('harq',harqCb.checked);});");
   html += F("phyFecCb.addEventListener('change',()=>{updateProtocol('phyfec',phyFecCb.checked);});");
@@ -1031,14 +1106,15 @@ String escapeJson(const String& value) {
 }
 
 // --- Применение радиоканала ---
-bool applyRadioChannel(uint8_t newIndex) {
+bool tuneToHomeChannel(uint8_t newIndex, bool updateSelection) {
   if (newIndex >= kHomeBankSize) {
     return false;
   }
-  float rx = frequency_tables::RX_HOME[newIndex];
-  float tx = frequency_tables::TX_HOME[newIndex];
 
-  int16_t rxState = radio.setFrequency(rx);
+  const float rx = frequency_tables::RX_HOME[newIndex];
+  const float tx = frequency_tables::TX_HOME[newIndex];
+
+  const int16_t rxState = radio.setFrequency(rx);
   if (rxState != RADIOLIB_ERR_NONE) {
     logRadioError("setFrequency(RX)", rxState);
     return false;
@@ -1047,7 +1123,125 @@ bool applyRadioChannel(uint8_t newIndex) {
   state.currentRxFreq = rx;
   state.currentTxFreq = tx;
 
+  if (updateSelection) {
+    state.channelIndex = newIndex;
+  }
+
   return ensureReceiveMode();
+}
+
+bool applyRadioChannel(uint8_t newIndex) {
+  if (!tuneToHomeChannel(newIndex, true)) {
+    return false;
+  }
+
+  state.fhss.previousChannel = state.channelIndex;
+  state.fhss.currentHopChannel = state.channelIndex;
+  state.fhss.currentHopIndex = 0;
+  state.fhss.nextHopIndex = (state.fhss.hopCount > 1) ? 1 : 0;
+  state.fhss.lastHopMillis = millis();
+  return true;
+}
+
+void initFhssDefaults() {
+  state.fhss.enabled = false;
+  state.fhss.hopCount = kHomeBankSize;
+  for (size_t i = 0; i < state.fhss.hopSequence.size(); ++i) {
+    state.fhss.hopSequence[i] = static_cast<uint8_t>(i);
+  }
+  state.fhss.currentHopIndex = 0;
+  state.fhss.nextHopIndex = (state.fhss.hopCount > 1) ? 1 : 0;
+  state.fhss.currentHopChannel = state.channelIndex;
+  state.fhss.previousChannel = state.channelIndex;
+  state.fhss.lastHopMillis = millis();
+}
+
+bool applyFhssHopByIndex(size_t hopIndex) {
+  if (state.fhss.hopCount == 0) {
+    return false;
+  }
+  if (hopIndex >= state.fhss.hopCount) {
+    hopIndex %= state.fhss.hopCount;
+  }
+
+  const uint8_t channel = state.fhss.hopSequence[hopIndex];
+  if (!tuneToHomeChannel(channel, false)) {
+    return false;
+  }
+
+  state.fhss.currentHopIndex = hopIndex;
+  state.fhss.currentHopChannel = channel;
+  state.fhss.nextHopIndex = (hopIndex + 1U) % state.fhss.hopCount;
+  state.fhss.lastHopMillis = millis();
+  return true;
+}
+
+bool setFhssEnabled(bool enable) {
+  if (enable == state.fhss.enabled) {
+    return true;
+  }
+
+  if (enable) {
+    if (state.fhss.hopCount == 0) {
+      initFhssDefaults();
+    }
+
+    state.fhss.previousChannel = state.channelIndex;
+    size_t startIndex = 0;
+    for (size_t i = 0; i < state.fhss.hopCount; ++i) {
+      if (state.fhss.hopSequence[i] == state.channelIndex) {
+        startIndex = i;
+        break;
+      }
+    }
+
+    state.fhss.enabled = true;
+    if (!applyFhssHopByIndex(startIndex)) {
+      state.fhss.enabled = false;
+      return false;
+    }
+    return true;
+  }
+
+  state.fhss.enabled = false;
+  return applyRadioChannel(state.fhss.previousChannel);
+}
+
+void updateFhss() {
+  (void)advanceFhssIfDue();
+}
+
+bool advanceFhssIfDue() {
+  if (!state.fhss.enabled) {
+    return false;
+  }
+
+  if (state.fhss.hopCount <= 1) {
+    return false;
+  }
+
+  const unsigned long now = millis();
+  if (state.fhss.lastHopMillis == 0) {
+    state.fhss.lastHopMillis = now;
+    return false;
+  }
+
+  const unsigned long elapsed = now - state.fhss.lastHopMillis;
+  if (elapsed < state.fhss.dwellTimeMs) {
+    return false;
+  }
+
+  const size_t nextIndex = state.fhss.nextHopIndex % state.fhss.hopCount;
+  if (!applyFhssHopByIndex(nextIndex)) {
+    state.fhss.enabled = false;
+    addEvent(F("FHSS отключён: не удалось переключить частоту"));
+    if (!applyRadioChannel(state.fhss.previousChannel)) {
+      addEvent(F("Не удалось вернуть фиксированный канал после ошибки FHSS"));
+    }
+    return false;
+  }
+
+  return true;
 }
 
 // --- Настройка мощности передачи ---
@@ -1233,15 +1427,20 @@ bool applyRadioPower(bool highPower) {
 }
 
 // --- Настройка фактора расширения SF ---
-bool applySpreadingFactor(bool useSf5) {
-  uint8_t targetSf = useSf5 ? 5 : kDefaultSpreadingFactor;
-  int16_t result = radio.setSpreadingFactor(targetSf);
+bool applySpreadingFactor(uint8_t spreadingFactor) {
+  if (spreadingFactor < 5 || spreadingFactor > 12) {
+    addEvent(String("Недопустимый SF: ") + String(spreadingFactor));
+    return false;
+  }
+
+  int16_t result = radio.setSpreadingFactor(spreadingFactor);
   if (result != RADIOLIB_ERR_NONE) {
     logRadioError("setSpreadingFactor", result);
     return false;
   }
-  state.useSf5 = useSf5;
-  state.currentSpreadingFactor = targetSf;
+
+  state.selectedSpreadingFactor = spreadingFactor;
+  state.currentSpreadingFactor = spreadingFactor;
   configureNarrowbandRxOptions();
   return true;
 }
@@ -1449,6 +1648,10 @@ void retransmitMissing(const std::vector<DataBlock>& blocks,
 bool transmitFrame(const std::array<uint8_t, kFixedFrameSize>& frame, const String& context) {
   std::vector<uint8_t> bytes(frame.begin(), frame.end());
   addEvent(String("→ ") + context + ": " + formatByteArray(bytes));
+
+  if (state.fhss.enabled) {
+    advanceFhssIfDue();
+  }
 
   int16_t freqState = radio.setFrequency(state.currentTxFreq);
   if (freqState != RADIOLIB_ERR_NONE) {
