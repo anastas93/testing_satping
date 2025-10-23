@@ -93,6 +93,9 @@ constexpr uint8_t kDataFlagLengthMask = 0x3C;     // маска длины по�
 
 constexpr uint8_t kAckFlagNeedParity = 0x01;      // получателю требуется PAR-передача
 
+constexpr uint8_t kAckTypeSuccess = 0x01;         // тип ACK: все пакеты успешно получены
+constexpr uint8_t kAckTypeMissing = 0x02;         // тип ACK: присутствуют потери, требуется переотправка
+
 constexpr uint8_t kFinFlagHarqUsed = 0x01;        // в ходе передачи использовался HARQ
 
 struct DataBlock {
@@ -149,6 +152,7 @@ struct AckNotification {
   uint16_t missingBitmap = 0;          // биты недостающих пакетов (1 = требуется повтор)
   bool needParity = false;             // требуется ли PAR-передача
   uint8_t reportedWindow = 0;          // размер окна, который видел получатель
+  uint8_t ackType = 0;                 // тип подтверждения (успех/потери)
 };
 
 // --- Диагностика и настройки длинных окон приёма ---
@@ -458,7 +462,8 @@ std::array<uint8_t, kFixedFrameSize> buildDataFrame(uint16_t seq,
 std::array<uint8_t, kFixedFrameSize> buildAckFrame(uint16_t baseSeq,
                                                    uint16_t missingBitmap,
                                                    bool needParity,
-                                                   uint8_t windowSize);
+                                                   uint8_t windowSize,
+                                                   uint8_t ackType);
 std::array<uint8_t, kFixedFrameSize> buildFinFrame(uint16_t length,
                                                    uint16_t crc,
                                                    bool harqUsed);
@@ -1865,7 +1870,8 @@ std::array<uint8_t, kFixedFrameSize> buildDataFrame(uint16_t seq,
 std::array<uint8_t, kFixedFrameSize> buildAckFrame(uint16_t baseSeq,
                                                    uint16_t missingBitmap,
                                                    bool needParity,
-                                                   uint8_t windowSize) {
+                                                   uint8_t windowSize,
+                                                   uint8_t ackType) {
   std::array<uint8_t, kFixedFrameSize> frame{};
   frame[0] = static_cast<uint8_t>(kFrameTypeAck | (needParity ? kAckFlagNeedParity : 0));
   frame[1] = static_cast<uint8_t>(baseSeq & 0xFFU);
@@ -1873,6 +1879,7 @@ std::array<uint8_t, kFixedFrameSize> buildAckFrame(uint16_t baseSeq,
   frame[3] = static_cast<uint8_t>(missingBitmap & 0xFFU);
   frame[4] = static_cast<uint8_t>((missingBitmap >> 8) & 0xFFU);
   frame[5] = windowSize;
+  frame[6] = ackType;
   return frame;
 }
 
@@ -2229,10 +2236,32 @@ void processIncomingAckFrame(const std::vector<uint8_t>& frame) {
   note.missingBitmap = static_cast<uint16_t>(frame[3]) | (static_cast<uint16_t>(frame[4]) << 8);
   note.needParity = (frame[0] & kAckFlagNeedParity) != 0;
   note.reportedWindow = frame[5];
+  note.ackType = (frame.size() > 6) ? frame[6] : ((note.missingBitmap == 0) ? kAckTypeSuccess : kAckTypeMissing);
   state.pendingAck = note;
-  addEvent(String("Принят ACK: base=") + String(note.baseSeq) +
-           ", missing=0x" + String(note.missingBitmap, 16) +
-           ", window=" + String(note.reportedWindow));
+  String log = String("Принят ACK: base=") + String(note.baseSeq) +
+               ", missing=0x" + String(note.missingBitmap, 16) +
+               ", window=" + String(note.reportedWindow) +
+               ", тип=" + String(note.ackType);
+
+  if (note.ackType == kAckTypeSuccess) {
+    log += " (все пакеты получены)";
+  } else if (note.ackType == kAckTypeMissing) {
+    log += " (есть потери: ";
+    bool first = true;
+    for (uint8_t bit = 0; bit < kBitmapWidth; ++bit) {
+      if ((note.missingBitmap & (1U << bit)) == 0U) {
+        continue;
+      }
+      if (!first) {
+        log += ",";
+      }
+      first = false;
+      log += String(static_cast<unsigned long>(note.baseSeq + bit));
+    }
+    log += ")";
+  }
+
+  addEvent(log);
 }
 
 // --- Обработка PAR-кадра (пока заглушка) ---
@@ -2363,7 +2392,8 @@ void prepareAck(uint16_t /*seq*/, uint8_t windowSize, bool forceSend) {
 }
 
 void sendAck(uint16_t baseSeq, uint16_t missingBitmap, bool needParity, uint8_t windowSize) {
-  auto frame = buildAckFrame(baseSeq, missingBitmap, needParity, windowSize);
+  const uint8_t ackType = (missingBitmap == 0) ? kAckTypeSuccess : kAckTypeMissing;
+  auto frame = buildAckFrame(baseSeq, missingBitmap, needParity, windowSize, ackType);
   transmitFrame(frame, F("ACK"));
 }
 
