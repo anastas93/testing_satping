@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
-#include <cstdlib>
 #include <chrono>
 #include <type_traits>
 #include <utility>
@@ -78,8 +77,6 @@ constexpr size_t kHarqDataBlock = 11;             // число DATA-пакет�
 constexpr size_t kHarqParityCount = 4;            // число PAR-пакетов в HARQ-блоке
 constexpr size_t kLongPacketSize = 124;           // длина длинного пакета с буквами A-Z
 constexpr const char* kIncomingColor = "#5CE16A"; // цвет отображения принятых сообщений
-constexpr unsigned long kDefaultFhssDwellMs = 500; // dwell по умолчанию для FHSS (мс)
-constexpr unsigned long kMinFhssDwellMs = 50;      // минимально допустимое dwell время (мс)
 
 // --- Константы формата кадров Lotest ---
 constexpr uint8_t kFrameTypeMask = 0xC0;          // верхние два бита определяют тип кадра
@@ -142,15 +139,6 @@ struct AckNotification {
   uint8_t reportedWindow = 0;          // размер окна, который видел получатель
 };
 
-// --- Настройки и текущее состояние программного FHSS ---
-struct FhssSettings {
-  bool enabled = false;                        // активирован ли режим прыгающей частоты
-  unsigned long dwellTimeMs = kDefaultFhssDwellMs; // длительность стоянки на канале
-  std::vector<uint8_t> sequence;               // последовательность индексов каналов банка HOME
-  size_t sequenceIndex = 0;                    // текущая позиция в последовательности
-  unsigned long lastHopMs = 0;                 // момент последнего прыжка
-};
-
 // --- Диагностика и настройки длинных окон приёма ---
 struct RxTimingDiagnostics {
   uint16_t preambleSymbols = static_cast<uint16_t>(kRadioDefaults.preambleLength); // текущая длина преамбулы
@@ -170,7 +158,7 @@ struct RxTimingDiagnostics {
 struct AppState {
   uint8_t channelIndex = 0;            // выбранный канал банка HOME
   bool highPower = false;              // признак использования мощности 22 dBm (иначе -5 dBm)
-  uint8_t selectedSpreadingFactor = kDefaultSpreadingFactor; // выбранный пользователем SF
+  bool useSf5 = false;                 // признак использования SF5 (false => SF7)
   float currentRxFreq = frequency_tables::RX_HOME[0]; // текущая частота приёма
   float currentTxFreq = frequency_tables::TX_HOME[0]; // текущая частота передачи
   unsigned long nextEventId = 1;       // счётчик идентификаторов для событий
@@ -183,7 +171,6 @@ struct AppState {
   float radioBandwidthKhz = kDefaultBandwidthKhz; // активная полоса пропускания
   uint8_t currentSpreadingFactor = kDefaultSpreadingFactor; // фактический SF
   RxTimingDiagnostics rxTiming;        // состояние тайминговых оптимизаций
-  FhssSettings fhss;                   // настройки программного FHSS
 } state;
 
 // --- Флаги приёма LoRa ---
@@ -316,18 +303,11 @@ void handleNotFound();
 void handleProtocolToggle();
 String buildIndexHtml();
 String buildChannelOptions(uint8_t selected);
-String buildSpreadingFactorOptions(uint8_t selected);
 String escapeJson(const String& value);
 String makeAccessPointSsid();
 bool applyRadioChannel(uint8_t newIndex);
 bool applyRadioPower(bool highPower);
-bool applySpreadingFactor(uint8_t targetSf);
-void handleFhssControl();
-void processFhssHop();
-bool parseFhssSequence(const String& text, std::vector<uint8_t>& outSequence);
-String formatFhssSequence();
-bool applyFhssChannel(uint8_t channelIndex, bool announce);
-void syncFhssIndexToChannel(uint8_t channelIndex);
+bool applySpreadingFactor(bool useSf5);
 bool applyPhyFec(bool enable);
 bool ensureReceiveMode();
 void processRadioEvents();
@@ -437,8 +417,8 @@ void setup() {
     addEvent("Радиомодуль успешно инициализирован");
 
     // Применяем настройки LoRa согласно требованиям задачи
-    state.selectedSpreadingFactor = kDefaultSpreadingFactor; // сохраняем выбранный SF для веб-интерфейса
-    if (!applySpreadingFactor(state.selectedSpreadingFactor)) {
+    state.useSf5 = (kDefaultSpreadingFactor == 5);
+    if (!applySpreadingFactor(state.useSf5)) {
       addEvent("Не удалось применить стартовый SF — используем параметры по умолчанию");
     }
     int16_t bwState = radio.setBandwidth(kDefaultBandwidthKhz);
@@ -474,15 +454,6 @@ void setup() {
 
     configureNarrowbandRxOptions();
 
-    state.fhss.sequence.clear();
-    for (uint8_t i = 0; i < kHomeBankSize; ++i) {
-      state.fhss.sequence.push_back(i);            // последовательность FHSS по умолчанию = все каналы HOME
-    }
-    state.fhss.sequenceIndex = 0;
-    state.fhss.dwellTimeMs = kDefaultFhssDwellMs;
-    state.fhss.lastHopMs = millis();
-    state.fhss.enabled = false;
-
     if (!applyRadioChannel(state.channelIndex)) {
       addEvent("Ошибка инициализации канала — проверьте модуль SX1262");
     }
@@ -513,7 +484,6 @@ void setup() {
   server.on("/api/send/random", HTTP_POST, handleSendRandomPacket);
   server.on("/api/send/custom", HTTP_POST, handleSendCustom);
   server.on("/api/sf", HTTP_POST, handleSpreadingFactorToggle);
-  server.on("/api/fhss", HTTP_POST, handleFhssControl);
   server.on("/api/protocol", HTTP_POST, handleProtocolToggle);
   server.onNotFound(handleNotFound);
   server.begin();
@@ -524,7 +494,6 @@ void setup() {
 void loop() {
   server.handleClient();
   processRadioEvents();
-  processFhssHop();
 }
 
 // --- Обработка радиособытий вне основного цикла ---
@@ -734,10 +703,6 @@ void handleChannelChange() {
   }
   if (applyRadioChannel(static_cast<uint8_t>(channel))) {
     state.channelIndex = static_cast<uint8_t>(channel);
-    if (state.fhss.enabled) {
-      syncFhssIndexToChannel(state.channelIndex);
-      state.fhss.lastHopMs = millis();
-    }
     addEvent(String("Выбран канал HOME #") + String(channel) + ", RX=" + String(state.currentRxFreq, 3) + " МГц, TX=" + String(state.currentTxFreq, 3) + " МГц");
     server.send(200, "application/json", "{\"ok\":true}");
   } else {
@@ -759,35 +724,9 @@ void handlePowerToggle() {
 
 // --- API: переключение фактора расширения ---
 void handleSpreadingFactorToggle() {
-  bool hasValue = false;
-  uint8_t requestedSf = state.selectedSpreadingFactor;
-
-  if (server.hasArg("sf")) {
-    String arg = server.arg("sf");
-    char* end = nullptr;
-    long value = std::strtol(arg.c_str(), &end, 10);
-    if (end == nullptr || *end != '\0') {
-      server.send(400, "application/json", "{\"error\":\"Неверное значение SF\"}");
-      return;
-    }
-    if (value < 5 || value > 12) {
-      server.send(400, "application/json", "{\"error\":\"SF допустим только 5..12\"}");
-      return;
-    }
-    requestedSf = static_cast<uint8_t>(value);
-    hasValue = true;
-  } else if (server.hasArg("sf5")) {
-    requestedSf = (server.arg("sf5") == "1") ? 5 : kDefaultSpreadingFactor; // совместимость со старым API
-    hasValue = true;
-  }
-
-  if (!hasValue) {
-    server.send(400, "application/json", "{\"error\":\"Параметр sf не указан\"}");
-    return;
-  }
-
-  if (applySpreadingFactor(requestedSf)) {
-    addEvent(String("Фактор расширения установлен: SF") + String(static_cast<unsigned long>(requestedSf)));
+  bool newSf5 = server.hasArg("sf5") && server.arg("sf5") == "1";
+  if (applySpreadingFactor(newSf5)) {
+    addEvent(String("Фактор расширения установлен: SF") + String(static_cast<unsigned long>(newSf5 ? 5 : kDefaultSpreadingFactor)));
     server.send(200, "application/json", "{\"ok\":true}");
   } else {
     server.send(500, "application/json", "{\"error\":\"Ошибка установки SF\"}");
@@ -921,9 +860,11 @@ String buildIndexHtml() {
     html += " checked";
   }
   html += "> Мощность 22 dBm (выкл — -5 dBm)</label>";
-  html += F("<label>Фактор расширения:</label><select id='sfSelect'>");
-  html += buildSpreadingFactorOptions(state.selectedSpreadingFactor);
-  html += F("</select>");
+  html += "<label><input type='checkbox' id='sf5'";
+  if (state.useSf5) {
+    html += " checked";
+  }
+  html += "> Фактор расширения SF5 (выкл — SF7)</label>";
   html += F("<fieldset><legend>Надёжность</legend>");
   html += "<label><input type='checkbox' id='interleaving'";
   if (state.protocol.interleaving) {
@@ -945,18 +886,6 @@ String buildIndexHtml() {
     html += " checked";
   }
   html += "> CRC-8 на DATA (payload=4 байта)</label>";
-  html += F("<fieldset><legend>FHSS</legend>");
-  html += "<label><input type='checkbox' id='fhssEnabled'";
-  if (state.fhss.enabled) {
-    html += " checked";
-  }
-  html += "> Включить программный FHSS</label>";
-  html += String("<label>Время стоянки, мс:<input type='number' min='50' id='fhssDwell' value='") +
-          String(static_cast<unsigned long>(state.fhss.dwellTimeMs)) + "'></label>";
-  html += String("<label>Последовательность каналов:<input type='text' id='fhssSequence' value='") +
-          formatFhssSequence() + "'></label>";
-  html += F("<button id='fhssApply'>Применить параметры FHSS</button>");
-  html += F("</fieldset>");
   html += F("</fieldset>");
   html += F("<div class='status' id='status'></div><div class='controls'>");
   html += F("<button id='sendLong'>Отправить длинный пакет 124 байта</button>");
@@ -966,20 +895,18 @@ String buildIndexHtml() {
   html += F("</div></section>");
 
   html += F("<section><h2>Журнал событий</h2><div id='log'></div></section></main><script>");
-    html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfSelect=document.getElementById('sfSelect');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const fhssEnabledCb=document.getElementById('fhssEnabled');const fhssDwellInput=document.getElementById('fhssDwell');const fhssSeqInput=document.getElementById('fhssSequence');const statusEl=document.getElementById('status');let lastId=0;");
+  html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfCb=document.getElementById('sf5');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const statusEl=document.getElementById('status');let lastId=0;");
   html += F("function appendLog(entry){const div=document.createElement('div');div.className='message';div.textContent=entry.text;if(entry.color){div.style.color=entry.color;}logEl.appendChild(div);logEl.scrollTop=logEl.scrollHeight;}");
   html += F("async function refreshLog(){try{const resp=await fetch(`/api/log?after=${lastId}`);if(!resp.ok)return;const data=await resp.json();data.events.forEach(evt=>{appendLog(evt);lastId=evt.id;});}catch(e){console.error(e);}}");
   html += F("async function postForm(url,body){const resp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(body)});if(!resp.ok){const err=await resp.json().catch(()=>({error:'Неизвестная ошибка'}));throw new Error(err.error||'Ошибка');}}");
   html += F("async function updateProtocol(field,value){const payload={};payload[field]=value?'1':'0';try{await postForm('/api/protocol',payload);statusEl.textContent='Настройки протокола обновлены';refreshLog();}catch(e){statusEl.textContent=e.message;}}");
   html += F("channelSel.addEventListener('change',async()=>{try{await postForm('/api/channel',{channel:channelSel.value});statusEl.textContent='Канал применён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("powerCb.addEventListener('change',async()=>{try{await postForm('/api/power',{high:powerCb.checked?'1':'0'});statusEl.textContent='Мощность обновлена';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
-    html += F("sfSelect.addEventListener('change',async()=>{try{await postForm('/api/sf',{sf:sfSelect.value});statusEl.textContent='Фактор расширения обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
+  html += F("sfCb.addEventListener('change',async()=>{try{await postForm('/api/sf',{sf5:sfCb.checked?'1':'0'});statusEl.textContent='Фактор расширения обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("interCb.addEventListener('change',()=>{updateProtocol('interleaving',interCb.checked);});");
   html += F("harqCb.addEventListener('change',()=>{updateProtocol('harq',harqCb.checked);});");
-    html += F("phyFecCb.addEventListener('change',()=>{updateProtocol('phyfec',phyFecCb.checked);});");
-    html += F("crc8Cb.addEventListener('change',()=>{updateProtocol('crc8',crc8Cb.checked);});");
-    html += F("fhssEnabledCb.addEventListener('change',async()=>{try{await postForm('/api/fhss',{enabled:fhssEnabledCb.checked?'1':'0'});statusEl.textContent='Режим FHSS переключен';refreshLog();}catch(e){statusEl.textContent=e.message;fhssEnabledCb.checked=!fhssEnabledCb.checked;}});");
-    html += F("document.getElementById('fhssApply').addEventListener('click',async()=>{const dwell=fhssDwellInput.value.trim();const seq=fhssSeqInput.value.trim();if(!dwell||!seq){statusEl.textContent='Укажите dwell и последовательность';return;}try{await postForm('/api/fhss',{dwell,sequence:seq});statusEl.textContent='Параметры FHSS обновлены';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
+  html += F("phyFecCb.addEventListener('change',()=>{updateProtocol('phyfec',phyFecCb.checked);});");
+  html += F("crc8Cb.addEventListener('change',()=>{updateProtocol('crc8',crc8Cb.checked);});");
   html += F("document.getElementById('sendLong').addEventListener('click',async()=>{try{await postForm('/api/send/long',{});statusEl.textContent='Длинный пакет отправлен';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("document.getElementById('sendRandom').addEventListener('click',async()=>{try{await postForm('/api/send/random',{});statusEl.textContent='Полный пакет отправлен';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("document.getElementById('sendCustom').addEventListener('click',async()=>{const input=document.getElementById('custom');const payload=input.value;if(!payload.trim()){statusEl.textContent='Введите сообщение';return;}try{await postForm('/api/send/custom',{payload});statusEl.textContent='Пользовательский пакет отправлен';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
@@ -999,31 +926,6 @@ String buildChannelOptions(uint8_t selected) {
     html += ">#" + String(i) + " — RX " + String(frequency_tables::RX_HOME[i], 3) + " МГц / TX " + String(frequency_tables::TX_HOME[i], 3) + " МГц</option>";
   }
   return html;
-}
-
-// --- Формирование HTML-опций для выбора SF ---
-String buildSpreadingFactorOptions(uint8_t selected) {
-  String html;
-  for (uint8_t sf = 5; sf <= 12; ++sf) {
-    html += "<option value='" + String(static_cast<unsigned long>(sf)) + "'";
-    if (sf == selected) {
-      html += " selected";
-    }
-    html += ">SF" + String(static_cast<unsigned long>(sf)) + "</option>";
-  }
-  return html;
-}
-
-// --- Формирование строки последовательности FHSS для веб-формы ---
-String formatFhssSequence() {
-  String text;
-  for (size_t i = 0; i < state.fhss.sequence.size(); ++i) {
-    if (i > 0) {
-      text += ",";
-    }
-    text += String(static_cast<unsigned long>(state.fhss.sequence[i]));
-  }
-  return text;
 }
 
 // --- Экранирование строки для JSON ---
@@ -1215,192 +1117,17 @@ bool applyRadioPower(bool highPower) {
 }
 
 // --- Настройка фактора расширения SF ---
-bool applySpreadingFactor(uint8_t targetSf) {
-  if (targetSf < 5 || targetSf > 12) {
-    addEvent(String("Недопустимый SF: ") + String(static_cast<unsigned long>(targetSf)));
-    return false;
-  }
+bool applySpreadingFactor(bool useSf5) {
+  uint8_t targetSf = useSf5 ? 5 : kDefaultSpreadingFactor;
   int16_t result = radio.setSpreadingFactor(targetSf);
   if (result != RADIOLIB_ERR_NONE) {
     logRadioError("setSpreadingFactor", result);
     return false;
   }
-  state.selectedSpreadingFactor = targetSf;
+  state.useSf5 = useSf5;
   state.currentSpreadingFactor = targetSf;
   configureNarrowbandRxOptions();
   return true;
-}
-
-// --- Синхронизация индекса FHSS с текущим каналом ---
-void syncFhssIndexToChannel(uint8_t channelIndex) {
-  for (size_t i = 0; i < state.fhss.sequence.size(); ++i) {
-    if (state.fhss.sequence[i] == channelIndex) {
-      state.fhss.sequenceIndex = i;
-      return;
-    }
-  }
-  if (!state.fhss.sequence.empty()) {
-    state.fhss.sequenceIndex = 0;
-    if (state.fhss.enabled) {
-      addEvent(String("FHSS: канал #") + String(static_cast<unsigned long>(channelIndex)) +
-               " отсутствует в последовательности, переходим к первому элементу");
-    }
-  }
-}
-
-// --- Применение канала в режиме FHSS ---
-bool applyFhssChannel(uint8_t channelIndex, bool announce) {
-  if (!applyRadioChannel(channelIndex)) {
-    return false;
-  }
-  state.channelIndex = channelIndex;
-  syncFhssIndexToChannel(channelIndex);
-  state.fhss.lastHopMs = millis();
-  if (announce) {
-    addEvent(String("FHSS → канал #") + String(static_cast<unsigned long>(channelIndex)) +
-             ", RX=" + String(state.currentRxFreq, 3) + " МГц, TX=" + String(state.currentTxFreq, 3) + " МГц");
-  }
-  return true;
-}
-
-// --- Разбор текстового списка каналов FHSS ---
-bool parseFhssSequence(const String& text, std::vector<uint8_t>& outSequence) {
-  outSequence.clear();
-  String trimmed = text;
-  trimmed.trim();
-  if (trimmed.length() == 0) {
-    return false;
-  }
-
-  if (trimmed.equalsIgnoreCase("default") || trimmed.equalsIgnoreCase("auto")) {
-    for (uint8_t i = 0; i < kHomeBankSize; ++i) {
-      outSequence.push_back(i);
-    }
-    return true;
-  }
-
-  int start = 0;
-  while (start < trimmed.length()) {
-    int comma = trimmed.indexOf(',', start);
-    String token = (comma == -1) ? trimmed.substring(start) : trimmed.substring(start, comma);
-    token.trim();
-    if (token.length() == 0) {
-      return false;
-    }
-    char* end = nullptr;
-    long value = std::strtol(token.c_str(), &end, 10);
-    if (end == nullptr || *end != '\0') {
-      return false;
-    }
-    if (value < 0 || value >= kHomeBankSize) {
-      return false;
-    }
-    uint8_t channel = static_cast<uint8_t>(value);
-    if (std::find(outSequence.begin(), outSequence.end(), channel) == outSequence.end()) {
-      outSequence.push_back(channel);
-    }
-    start = (comma == -1) ? trimmed.length() : (comma + 1);
-  }
-
-  return !outSequence.empty();
-}
-
-// --- Обработчик API FHSS ---
-void handleFhssControl() {
-  bool handled = false;
-
-  if (server.hasArg("dwell")) {
-    String dwellArg = server.arg("dwell");
-    char* end = nullptr;
-    long value = std::strtol(dwellArg.c_str(), &end, 10);
-    if (end == nullptr || *end != '\0' || value < static_cast<long>(kMinFhssDwellMs)) {
-      server.send(400, "application/json", "{\"error\":\"dwell должен быть ≥ 50 мс\"}");
-      return;
-    }
-    state.fhss.dwellTimeMs = static_cast<unsigned long>(value);
-    state.fhss.lastHopMs = millis();
-    addEvent(String("FHSS: dwell установлен в ") + String(state.fhss.dwellTimeMs) + " мс");
-    handled = true;
-  }
-
-  if (server.hasArg("sequence")) {
-    std::vector<uint8_t> sequence;
-    if (!parseFhssSequence(server.arg("sequence"), sequence)) {
-      server.send(400, "application/json", "{\"error\":\"Не удалось разобрать последовательность канала\"}");
-      return;
-    }
-    state.fhss.sequence = sequence;
-    state.fhss.sequenceIndex = 0;
-    addEvent(String("FHSS: новая последовательность из ") + String(static_cast<unsigned long>(state.fhss.sequence.size())) +
-             " каналов");
-    if (state.fhss.enabled && !state.fhss.sequence.empty()) {
-      uint8_t target = state.fhss.sequence[state.fhss.sequenceIndex];
-      if (!applyFhssChannel(target, true)) {
-        server.send(500, "application/json", "{\"error\":\"Не удалось применить первый канал FHSS\"}");
-        return;
-      }
-    } else {
-      syncFhssIndexToChannel(state.channelIndex);
-    }
-    handled = true;
-  }
-
-  if (server.hasArg("enabled")) {
-    bool enable = server.arg("enabled") == "1";
-    handled = true;
-    if (enable != state.fhss.enabled) {
-      if (enable && state.fhss.sequence.empty()) {
-        for (uint8_t i = 0; i < kHomeBankSize; ++i) {
-          state.fhss.sequence.push_back(i);
-        }
-      }
-      state.fhss.enabled = enable;
-      state.fhss.lastHopMs = millis();
-      if (enable && !state.fhss.sequence.empty()) {
-        syncFhssIndexToChannel(state.channelIndex);
-        uint8_t target = state.fhss.sequence[state.fhss.sequenceIndex];
-        if (target != state.channelIndex) {
-          if (!applyFhssChannel(target, true)) {
-            server.send(500, "application/json", "{\"error\":\"Не удалось активировать FHSS\"}");
-            return;
-          }
-        } else {
-          addEvent(String("FHSS включён, стартуем с канала #") +
-                   String(static_cast<unsigned long>(target)));
-        }
-      }
-      if (enable) {
-        addEvent(String("FHSS включён: ") + String(static_cast<unsigned long>(state.fhss.sequence.size())) +
-                 " каналов, dwell=" + String(state.fhss.dwellTimeMs) + " мс");
-      } else {
-        addEvent("FHSS выключен");
-      }
-    }
-  }
-
-  if (!handled) {
-    server.send(400, "application/json", "{\"error\":\"Параметры не переданы\"}");
-    return;
-  }
-
-  server.send(200, "application/json", "{\"ok\":true}");
-}
-
-// --- Планировщик прыжков FHSS ---
-void processFhssHop() {
-  if (!state.fhss.enabled || state.fhss.sequence.empty()) {
-    return;
-  }
-  const unsigned long now = millis();
-  if (now - state.fhss.lastHopMs < state.fhss.dwellTimeMs) {
-    return;
-  }
-  state.fhss.sequenceIndex = (state.fhss.sequenceIndex + 1) % state.fhss.sequence.size();
-  uint8_t nextChannel = state.fhss.sequence[state.fhss.sequenceIndex];
-  if (!applyFhssChannel(nextChannel, true)) {
-    addEvent("FHSS: не удалось перейти на следующий канал");
-    state.fhss.lastHopMs = now;
-  }
 }
 
 // --- Переключение PHY FEC ---
