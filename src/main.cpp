@@ -16,6 +16,7 @@
 #include <deque>
 #include <numeric>
 #include <cmath>
+#include <limits>
 #if !defined(ARDUINO)
 #include <thread>
 #endif
@@ -166,16 +167,26 @@ struct RxTimingDiagnostics {
   bool reportedMissingLdroSupport = false;        // уже сообщали об отсутствии API принудительного LDRO
 };
 
+struct FhssHop {
+  uint8_t channel = 0;        // базовый канал HOME для прыжка
+  float offsetKhz = 0.0f;     // дополнительное смещение частоты в килогерцах
+};
+
+constexpr size_t kMaxFhssHops = 32; // максимальное количество шагов в последовательности FHSS
+
 struct FhssConfig {
-  bool enabled = false;                                  // включён ли программный FHSS
-  unsigned long dwellTimeMs = 250;                       // длительность стоянки на одном прыжке
-  std::array<uint8_t, kHomeBankSize> hopSequence{};      // последовательность каналов HOME для прыжков
-  size_t hopCount = 0;                                   // фактическое количество активных каналов в последовательности
-  size_t currentHopIndex = 0;                            // индекс текущего прыжка в массиве
-  size_t nextHopIndex = 0;                               // индекс следующего прыжка для передачи/приёма
-  uint8_t currentHopChannel = 0;                         // номер канала HOME, на котором сейчас работаем
-  uint8_t previousChannel = 0;                           // сохранённый «фиксированный» канал для возврата при выключении FHSS
-  unsigned long lastHopMillis = 0;                       // отметка времени последнего переключения частоты
+  bool enabled = false;                                              // включён ли программный FHSS
+  unsigned long dwellTimeMs = 250;                                   // длительность стоянки на одном прыжке
+  std::array<FhssHop, kMaxFhssHops> hopSequence{};                   // последовательность прыжков с учётом смещений
+  size_t hopCount = 0;                                               // фактическое количество активных шагов
+  size_t currentHopIndex = 0;                                        // индекс текущего прыжка в массиве
+  size_t nextHopIndex = 0;                                           // индекс следующего прыжка для передачи/приёма
+  uint8_t currentHopChannel = 0;                                     // номер канала HOME, на котором сейчас работаем
+  float currentHopOffsetKhz = 0.0f;                                  // применённое смещение к текущему каналу
+  uint8_t previousChannel = 0;                                       // сохранённый «фиксированный» канал для возврата при выключении FHSS
+  unsigned long lastHopMillis = 0;                                   // отметка времени последнего переключения частоты
+  bool limitToTenKhz = true;                                         // ограничивать прыжки диапазоном ±5 кГц
+  uint8_t baseChannelForTenKhz = 0;                                  // базовый канал для узкополосного FHSS
 };
 
 struct AppState {
@@ -408,7 +419,7 @@ String buildChannelOptions(uint8_t selected);
 String escapeJson(const String& value);
 String makeAccessPointSsid();
 bool applyRadioChannel(uint8_t newIndex);
-bool tuneToHomeChannel(uint8_t newIndex, bool updateSelection);
+bool tuneToHomeChannel(uint8_t newIndex, bool updateSelection, float offsetKhz = 0.0f);
 bool applyRadioPower(bool highPower);
 bool applySpreadingFactor(uint8_t spreadingFactor);
 bool applyPhyFec(bool enable);
@@ -460,6 +471,8 @@ void resetReceiveState();
 void logReceivedMessage(const std::vector<uint8_t>& payload);
 void logRadioError(const String& context, int16_t code);
 void initFhssDefaults();
+void rebuildFhssSequence();
+String formatFhssHopDescription(uint8_t channel, float offsetKhz);
 bool setFhssEnabled(bool enable);
 void updateFhss();
 bool applyFhssHopByIndex(size_t hopIndex);
@@ -830,11 +843,21 @@ void handleChannelChange() {
   if (state.fhss.enabled) {
     state.channelIndex = newIndex;
     state.fhss.previousChannel = newIndex;
+    rebuildFhssSequence();
     size_t startIndex = 0;
+    float bestOffset = std::numeric_limits<float>::max();
     for (size_t i = 0; i < state.fhss.hopCount; ++i) {
-      if (state.fhss.hopSequence[i] == newIndex) {
+      const FhssHop& hop = state.fhss.hopSequence[i];
+      if (hop.channel != state.channelIndex) {
+        continue;
+      }
+      const float absOffset = std::fabs(hop.offsetKhz);
+      if (absOffset < bestOffset) {
+        bestOffset = absOffset;
         startIndex = i;
-        break;
+        if (absOffset < 0.001f) {
+          break;                                                   // стремимся начать с минимального смещения
+        }
       }
     }
     success = applyFhssHopByIndex(startIndex);
@@ -888,9 +911,15 @@ void handleFhssToggle() {
   bool enable = server.hasArg("enable") && server.arg("enable") == "1";
   if (setFhssEnabled(enable)) {
     if (enable) {
-      addEvent(String("FHSS включён, стартовый канал HOME #") + String(state.fhss.currentHopChannel));
+      const String hopInfo = formatFhssHopDescription(state.fhss.currentHopChannel,
+                                                     state.fhss.currentHopOffsetKhz);
+      addEvent(String("FHSS включён: ") + hopInfo + ", RX=" + String(state.currentRxFreq, 3) +
+               " МГц, TX=" + String(state.currentTxFreq, 3) + " МГц");
     } else {
-      addEvent(String("FHSS выключен, возвращаемся к каналу HOME #") + String(state.channelIndex));
+      const String hopInfo = formatFhssHopDescription(state.channelIndex, 0.0f);
+      addEvent(String("FHSS выключен, фиксированный ") + hopInfo + ", RX=" +
+               String(state.currentRxFreq, 3) + " МГц, TX=" + String(state.currentTxFreq, 3) +
+               " МГц");
     }
     server.send(200, "application/json", "{\"ok\":true}");
   } else {
@@ -1130,13 +1159,14 @@ String escapeJson(const String& value) {
 }
 
 // --- Применение радиоканала ---
-bool tuneToHomeChannel(uint8_t newIndex, bool updateSelection) {
+bool tuneToHomeChannel(uint8_t newIndex, bool updateSelection, float offsetKhz) {
   if (newIndex >= kHomeBankSize) {
     return false;
   }
 
-  const float rx = frequency_tables::RX_HOME[newIndex];
-  const float tx = frequency_tables::TX_HOME[newIndex];
+  const float offsetMhz = offsetKhz / 1000.0f;                        // перевод смещения из кГц в МГц
+  const float rx = frequency_tables::RX_HOME[newIndex] + offsetMhz;   // итоговая частота приёма
+  const float tx = frequency_tables::TX_HOME[newIndex] + offsetMhz;   // итоговая частота передачи
 
   const int16_t rxState = radio.setFrequency(rx);
   if (rxState != RADIOLIB_ERR_NONE) {
@@ -1155,29 +1185,63 @@ bool tuneToHomeChannel(uint8_t newIndex, bool updateSelection) {
 }
 
 bool applyRadioChannel(uint8_t newIndex) {
-  if (!tuneToHomeChannel(newIndex, true)) {
+  if (!tuneToHomeChannel(newIndex, true, 0.0f)) {
     return false;
   }
 
   state.fhss.previousChannel = state.channelIndex;
   state.fhss.currentHopChannel = state.channelIndex;
-  state.fhss.currentHopIndex = 0;
-  state.fhss.nextHopIndex = (state.fhss.hopCount > 1) ? 1 : 0;
+  state.fhss.currentHopOffsetKhz = 0.0f;
   state.fhss.lastHopMillis = millis();
+  state.fhss.baseChannelForTenKhz = state.channelIndex;
+  rebuildFhssSequence();
   return true;
 }
 
 void initFhssDefaults() {
   state.fhss.enabled = false;
-  state.fhss.hopCount = kHomeBankSize;
-  for (size_t i = 0; i < state.fhss.hopSequence.size(); ++i) {
-    state.fhss.hopSequence[i] = static_cast<uint8_t>(i);
+  state.fhss.limitToTenKhz = true;                // по умолчанию прыгаем в пределах ±5 кГц от канала
+  state.fhss.previousChannel = state.channelIndex;
+  state.fhss.baseChannelForTenKhz = state.channelIndex;
+  rebuildFhssSequence();
+}
+
+void rebuildFhssSequence() {
+  state.fhss.baseChannelForTenKhz = state.channelIndex;               // актуализируем базовый канал для узкополосного режима
+  const uint8_t baseChannel = state.fhss.baseChannelForTenKhz;
+
+  if (state.fhss.limitToTenKhz) {
+    constexpr std::array<float, 7> kTenKhzOffsets = {0.0f, -5.0f, 5.0f, -3.0f, 3.0f, -1.0f, 1.0f};
+    const size_t count = std::min(kTenKhzOffsets.size(), state.fhss.hopSequence.size());
+    state.fhss.hopCount = count;
+    for (size_t i = 0; i < count; ++i) {
+      state.fhss.hopSequence[i].channel = baseChannel;                // все прыжки вокруг выбранного канала
+      state.fhss.hopSequence[i].offsetKhz = kTenKhzOffsets[i];        // смещение в пределах ±5 кГц
+    }
+  } else {
+    const size_t count = std::min(static_cast<size_t>(kHomeBankSize), state.fhss.hopSequence.size());
+    state.fhss.hopCount = count;
+    for (size_t i = 0; i < count; ++i) {
+      state.fhss.hopSequence[i].channel = static_cast<uint8_t>(i);    // классический перебор по всему банку HOME
+      state.fhss.hopSequence[i].offsetKhz = 0.0f;                     // без дополнительного смещения
+    }
   }
+
   state.fhss.currentHopIndex = 0;
   state.fhss.nextHopIndex = (state.fhss.hopCount > 1) ? 1 : 0;
-  state.fhss.currentHopChannel = state.channelIndex;
-  state.fhss.previousChannel = state.channelIndex;
+  state.fhss.currentHopChannel = baseChannel;
+  state.fhss.currentHopOffsetKhz = 0.0f;
   state.fhss.lastHopMillis = millis();
+}
+
+String formatFhssHopDescription(uint8_t channel, float offsetKhz) {
+  String text = String("канал HOME #") + String(channel);                 // базовое описание канала
+  if (std::fabs(offsetKhz) > 0.0005f) {
+    text += String(" (смещение ") + String(offsetKhz, 2) + F(" кГц)");   // отображаем смещение, если оно заметно
+  } else {
+    text += F(" (без смещения)");
+  }
+  return text;
 }
 
 bool applyFhssHopByIndex(size_t hopIndex) {
@@ -1188,13 +1252,14 @@ bool applyFhssHopByIndex(size_t hopIndex) {
     hopIndex %= state.fhss.hopCount;
   }
 
-  const uint8_t channel = state.fhss.hopSequence[hopIndex];
-  if (!tuneToHomeChannel(channel, false)) {
+  const FhssHop& hop = state.fhss.hopSequence[hopIndex];
+  if (!tuneToHomeChannel(hop.channel, false, hop.offsetKhz)) {
     return false;
   }
 
   state.fhss.currentHopIndex = hopIndex;
-  state.fhss.currentHopChannel = channel;
+  state.fhss.currentHopChannel = hop.channel;
+  state.fhss.currentHopOffsetKhz = hop.offsetKhz;
   state.fhss.nextHopIndex = (hopIndex + 1U) % state.fhss.hopCount;
   state.fhss.lastHopMillis = millis();
   return true;
@@ -1211,11 +1276,21 @@ bool setFhssEnabled(bool enable) {
     }
 
     state.fhss.previousChannel = state.channelIndex;
+    rebuildFhssSequence();
     size_t startIndex = 0;
+    float bestOffset = std::numeric_limits<float>::max();
     for (size_t i = 0; i < state.fhss.hopCount; ++i) {
-      if (state.fhss.hopSequence[i] == state.channelIndex) {
+      const FhssHop& hop = state.fhss.hopSequence[i];
+      if (hop.channel != state.channelIndex) {
+        continue;
+      }
+      const float absOffset = std::fabs(hop.offsetKhz);
+      if (absOffset < bestOffset) {
+        bestOffset = absOffset;
         startIndex = i;
-        break;
+        if (absOffset < 0.001f) {
+          break;                                                   // нашли практически нулевое смещение
+        }
       }
     }
 
