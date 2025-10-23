@@ -59,7 +59,7 @@ static constexpr float TX_HOME[HOME_BANK_SIZE] = {
 
 // --- Глобальные объекты периферии ---
 SPIClass radioSPI(VSPI);                          // аппаратный SPI-порт, обслуживающий радиомодуль
-SX1262 radio = new Module(5, 26, 27, 25, radioSPI); // используем VSPI сразу при создании объекта Module
+SX1262 radio = new Module(5, 14, 27, 25, radioSPI); // используем VSPI сразу при создании объекта Module
 WebServer server(80);                             // встроенный HTTP-сервер ESP32
 
 // --- Константы проекта ---
@@ -976,7 +976,8 @@ bool applyRadioChannel(uint8_t newIndex) {
 
 // --- Настройка мощности передачи ---
 // --- Настройка длительного окна приёма для узкой полосы ---
-void configureNarrowbandRxOptions() {
+template <typename Radio>
+void configureNarrowbandRxOptionsImpl(Radio& radioRef) {
   const float bandwidthKhz = state.radioBandwidthKhz;
   const uint8_t sf = state.currentSpreadingFactor;
   const float bandwidthHz = bandwidthKhz * 1000.0f;
@@ -993,7 +994,7 @@ void configureNarrowbandRxOptions() {
   }
 
   if (targetPreamble != state.rxTiming.preambleSymbols) {
-    const int16_t code = radio.setPreambleLength(targetPreamble);
+    const int16_t code = radioRef.setPreambleLength(targetPreamble);
     if (code == RADIOLIB_ERR_NONE) {
       state.rxTiming.preambleSymbols = targetPreamble;
       logRxTimingEvent(String("Преамбула увеличена до ") + String(targetPreamble) +
@@ -1003,10 +1004,10 @@ void configureNarrowbandRxOptions() {
     }
   }
 
-  if constexpr (radiolib_features::HasSetStopRxTimerOnPreamble<SX1262>::value) {
+  if constexpr (radiolib_features::HasSetStopRxTimerOnPreamble<Radio>::value) {
     const bool desiredStop = narrowBandwidth;
     if (desiredStop != state.rxTiming.stopTimerOnPreamble) {
-      const int16_t code = radio.setStopRxTimerOnPreamble(desiredStop);
+      const int16_t code = radioRef.setStopRxTimerOnPreamble(desiredStop);
       if (code == RADIOLIB_ERR_NONE) {
         state.rxTiming.stopTimerOnPreamble = desiredStop;
         logRxTimingEvent(String("StopRxTimerOnPreamble ") + (desiredStop ? "включён" : "выключен"));
@@ -1021,9 +1022,9 @@ void configureNarrowbandRxOptions() {
   }
 
   const bool needLdro = (symbolDurationMs >= 16.0f);
-  if constexpr (radiolib_features::HasSetLowDataRateOptimization<SX1262>::value) {
+  if constexpr (radiolib_features::HasSetLowDataRateOptimization<Radio>::value) {
     if (needLdro != state.rxTiming.ldroForced) {
-      const int16_t code = radio.setLowDataRateOptimization(needLdro);
+      const int16_t code = radioRef.setLowDataRateOptimization(needLdro);
       if (code == RADIOLIB_ERR_NONE) {
         state.rxTiming.ldroForced = needLdro;
         logRxTimingEvent(String("LDRO ") + (needLdro ? "включён" : "выключен") +
@@ -1048,10 +1049,10 @@ void configureNarrowbandRxOptions() {
     }
   }
 
-  if constexpr (radiolib_features::HasSetRxTimeoutSymbols<SX1262>::value) {
+  if constexpr (radiolib_features::HasSetRxTimeoutSymbols<Radio>::value) {
     const uint32_t applied = useContinuous ? 0U : timeoutSymbols;
     if (applied != state.rxTiming.rxTimeoutSymbols) {
-      const int16_t code = radio.setRxTimeout(applied);
+      const int16_t code = radioRef.setRxTimeout(applied);
       if (code == RADIOLIB_ERR_NONE) {
         state.rxTiming.rxTimeoutSymbols = applied;
         state.rxTiming.rxContinuous = useContinuous;
@@ -1065,11 +1066,11 @@ void configureNarrowbandRxOptions() {
         logRadioError("setRxTimeout", code);
       }
     }
-  } else if constexpr (radiolib_features::HasSetRxTimeoutSeconds<SX1262>::value) {
+  } else if constexpr (radiolib_features::HasSetRxTimeoutSeconds<Radio>::value) {
     const float timeoutSeconds = useContinuous ? 0.0f : (symbolDurationMs * timeoutSymbols) / 1000.0f;
     const bool shouldApply = useContinuous || needExtendedTimeout;
     if (shouldApply) {
-      const int16_t code = radio.setRxTimeout(timeoutSeconds);
+      const int16_t code = radioRef.setRxTimeout(timeoutSeconds);
       if (code == RADIOLIB_ERR_NONE) {
         state.rxTiming.rxTimeoutSymbols = useContinuous ? 0U : timeoutSymbols;
         state.rxTiming.rxContinuous = useContinuous;
@@ -1087,11 +1088,11 @@ void configureNarrowbandRxOptions() {
     logRxTimingEvent(F("RadioLib не даёт выставить RX тайм-аут — окно нужно держать вручную"));
   }
 
-  if constexpr (radiolib_features::HasSetLoRaSymbNumTimeout<SX1262>::value) {
+  if constexpr (radiolib_features::HasSetLoRaSymbNumTimeout<Radio>::value) {
     const uint16_t desired = static_cast<uint16_t>(std::min<uint32_t>(255U,
                                                                       static_cast<uint32_t>(targetPreamble + 8U)));
     if (desired != 0 && desired != state.rxTiming.symbTimeout) {
-      const int16_t code = radio.setLoRaSymbNumTimeout(static_cast<uint8_t>(desired));
+      const int16_t code = radioRef.setLoRaSymbNumTimeout(static_cast<uint8_t>(desired));
       if (code == RADIOLIB_ERR_NONE) {
         state.rxTiming.symbTimeout = desired;
         logRxTimingEvent(String("LoRaSymbNumTimeout установлен в ") + String(desired) + " символов");
@@ -1103,6 +1104,10 @@ void configureNarrowbandRxOptions() {
     state.rxTiming.reportedMissingSymbTimeoutSupport = true;
     logRxTimingEvent(F("Нет доступа к LoRaSymbNumTimeout — оставляем поиск заголовка по умолчанию"));
   }
+}
+
+void configureNarrowbandRxOptions() {
+  configureNarrowbandRxOptionsImpl(radio);
 }
 
 // --- Настройка мощности передачи ---
