@@ -161,6 +161,7 @@ struct RxTimingDiagnostics {
   bool rxContinuous = false;                      // удалось ли перевести в непрерывный режим
   bool ldroForced = false;                        // включена ли принудительная оптимизация LDRO
   unsigned long lastSetRxMs = 0;                  // отметка времени последнего SetRx
+  unsigned long lastSetRxLogMs = 0;               // отметка времени последнего логирования SetRx (для подавления спама)
   bool reportedMissingStopTimerSupport = false;   // уже сообщали об отсутствии API StopRxTimerOnPreamble
   bool reportedMissingRxTimeoutSupport = false;   // уже сообщали об отсутствии API установки тайм-аута
   bool reportedMissingSymbTimeoutSupport = false; // уже сообщали об отсутствии API SymbNumTimeout
@@ -1562,8 +1563,24 @@ bool ensureReceiveMode() {
     logRadioError("startReceive", stateCode);
     return false;
   }
-  state.rxTiming.lastSetRxMs = millis();
-  logRxTimingEvent(F("Команда SetRx отправлена (переход в ожидание пакета)"));
+  const unsigned long now = millis();
+  state.rxTiming.lastSetRxMs = now;
+
+  bool shouldLog = true;
+  if (state.fhss.enabled && state.fhss.hopCount > 1U) {
+    constexpr unsigned long kFhssSetRxLogIntervalMs = 1000; // минимальная пауза между логами при активном FHSS
+    if (state.rxTiming.lastSetRxLogMs != 0U) {
+      const unsigned long delta = now - state.rxTiming.lastSetRxLogMs;
+      if (delta < kFhssSetRxLogIntervalMs) {
+        shouldLog = false;
+      }
+    }
+  }
+
+  if (shouldLog) {
+    state.rxTiming.lastSetRxLogMs = now;
+    logRxTimingEvent(F("Команда SetRx отправлена (переход в ожидание пакета)"));
+  }
   return true;
 }
 
