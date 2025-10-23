@@ -59,7 +59,7 @@ static constexpr float TX_HOME[HOME_BANK_SIZE] = {
 
 // --- Глобальные объекты периферии ---
 SPIClass radioSPI(VSPI);                          // аппаратный SPI-порт, обслуживающий радиомодуль
-SX1262 radio = new Module(5, 26, 27, 25, radioSPI); // используем VSPI сразу при создании объекта Module
+SX1262 radio = new Module(5, 14, 27, 25, radioSPI); // используем VSPI сразу при создании объекта Module
 WebServer server(80);                             // встроенный HTTP-сервер ESP32
 
 // --- Константы проекта ---
