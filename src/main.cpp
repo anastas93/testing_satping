@@ -238,7 +238,6 @@ int16_t clearIrqFlags(Radio& radio, uint32_t mask) {
     return radio.clearIrqStatus();                               // современный API без аргументов
   }
 }
-
 } // namespace radiolib_compat
 
 // --- Проверки наличия специфичных методов RadioLib для настройки таймингов ---
@@ -285,7 +284,84 @@ struct HasSetLowDataRateOptimization<
     T,
     std::void_t<decltype(std::declval<T&>().setLowDataRateOptimization(true))>> : std::true_type {};
 
+template <typename T, typename = void>
+struct HasForceLdro : std::false_type {};
+
+template <typename T>
+struct HasForceLdro<
+    T,
+    std::void_t<decltype(std::declval<T&>().forceLDRO(true))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasAutoLdro : std::false_type {};
+
+template <typename T>
+struct HasAutoLdro<
+    T,
+    std::void_t<decltype(std::declval<T&>().autoLDRO())>> : std::true_type {};
+
 } // namespace radiolib_features
+
+namespace radiolib_compat {
+
+template <typename Radio>
+int16_t setStopRxTimerOnPreambleIfSupported(Radio& radio, bool enable) {
+  if constexpr (radiolib_features::HasSetStopRxTimerOnPreamble<Radio>::value) {
+    return radio.setStopRxTimerOnPreamble(enable);
+  } else {
+    (void)radio;
+    (void)enable;
+    return RADIOLIB_ERR_UNSUPPORTED;
+  }
+}
+
+template <typename Radio>
+int16_t setLowDataRateOptimizationIfSupported(Radio& radio, bool enable) {
+  if constexpr (radiolib_features::HasSetLowDataRateOptimization<Radio>::value) {
+    return radio.setLowDataRateOptimization(enable);
+  } else if constexpr (radiolib_features::HasForceLdro<Radio>::value) {
+    return radio.forceLDRO(enable);
+  } else {
+    (void)radio;
+    (void)enable;
+    return RADIOLIB_ERR_UNSUPPORTED;
+  }
+}
+
+template <typename Radio>
+int16_t setRxTimeoutSymbolsIfSupported(Radio& radio, uint32_t symbols) {
+  if constexpr (radiolib_features::HasSetRxTimeoutSymbols<Radio>::value) {
+    return radio.setRxTimeout(symbols);
+  } else {
+    (void)radio;
+    (void)symbols;
+    return RADIOLIB_ERR_UNSUPPORTED;
+  }
+}
+
+template <typename Radio>
+int16_t setRxTimeoutSecondsIfSupported(Radio& radio, float seconds) {
+  if constexpr (radiolib_features::HasSetRxTimeoutSeconds<Radio>::value) {
+    return radio.setRxTimeout(seconds);
+  } else {
+    (void)radio;
+    (void)seconds;
+    return RADIOLIB_ERR_UNSUPPORTED;
+  }
+}
+
+template <typename Radio>
+int16_t setLoRaSymbNumTimeoutIfSupported(Radio& radio, uint8_t symbols) {
+  if constexpr (radiolib_features::HasSetLoRaSymbNumTimeout<Radio>::value) {
+    return radio.setLoRaSymbNumTimeout(symbols);
+  } else {
+    (void)radio;
+    (void)symbols;
+    return RADIOLIB_ERR_UNSUPPORTED;
+  }
+}
+
+} // namespace radiolib_compat
 
 // --- Вспомогательные функции объявления ---
 void IRAM_ATTR onRadioDio1Rise();
@@ -984,6 +1060,15 @@ void configureNarrowbandRxOptions() {
       (bandwidthHz > 0.0f) ? (static_cast<float>(1UL << sf) / bandwidthHz) * 1000.0f : 0.0f;
   const bool narrowBandwidth = (bandwidthKhz <= 10.0f);
   const bool veryNarrowBandwidth = (bandwidthKhz <= 8.0f);
+  constexpr bool kStopRxTimerSupported =
+      radiolib_features::HasSetStopRxTimerOnPreamble<SX1262>::value;
+  constexpr bool kDirectLdroControlSupported =
+      radiolib_features::HasSetLowDataRateOptimization<SX1262>::value ||
+      radiolib_features::HasForceLdro<SX1262>::value;
+  constexpr bool kRxTimeoutSymbolsSupported =
+      radiolib_features::HasSetRxTimeoutSymbols<SX1262>::value;
+  constexpr bool kLoRaSymbTimeoutSupported =
+      radiolib_features::HasSetLoRaSymbNumTimeout<SX1262>::value;
 
   uint16_t targetPreamble = state.rxTiming.preambleSymbols;
   if (veryNarrowBandwidth) {
@@ -1003,36 +1088,47 @@ void configureNarrowbandRxOptions() {
     }
   }
 
-  if constexpr (radiolib_features::HasSetStopRxTimerOnPreamble<SX1262>::value) {
-    const bool desiredStop = narrowBandwidth;
-    if (desiredStop != state.rxTiming.stopTimerOnPreamble) {
-      const int16_t code = radio.setStopRxTimerOnPreamble(desiredStop);
-      if (code == RADIOLIB_ERR_NONE) {
-        state.rxTiming.stopTimerOnPreamble = desiredStop;
-        logRxTimingEvent(String("StopRxTimerOnPreamble ") + (desiredStop ? "включён" : "выключен"));
-      } else {
-        logRadioError("setStopRxTimerOnPreamble", code);
+  const bool desiredStop = narrowBandwidth;
+  if (desiredStop != state.rxTiming.stopTimerOnPreamble) {
+    const int16_t code =
+        radiolib_compat::setStopRxTimerOnPreambleIfSupported(radio, desiredStop);
+    if (code == RADIOLIB_ERR_NONE) {
+      state.rxTiming.stopTimerOnPreamble = desiredStop;
+      logRxTimingEvent(String("StopRxTimerOnPreamble ") + (desiredStop ? "включён" : "выключен"));
+    } else if (code == RADIOLIB_ERR_UNSUPPORTED) {
+      if (narrowBandwidth && !state.rxTiming.reportedMissingStopTimerSupport) {
+        state.rxTiming.reportedMissingStopTimerSupport = true;
+        logRxTimingEvent(
+            F("RadioLib не поддерживает StopRxTimerOnPreamble — следим за таймерами вручную"));
       }
+    } else {
+      logRadioError("setStopRxTimerOnPreamble", code);
     }
-  } else if (narrowBandwidth && !state.rxTiming.reportedMissingStopTimerSupport) {
+  } else if (!kStopRxTimerSupported && narrowBandwidth &&
+             !state.rxTiming.reportedMissingStopTimerSupport) {
     state.rxTiming.reportedMissingStopTimerSupport = true;
     logRxTimingEvent(
         F("RadioLib не поддерживает StopRxTimerOnPreamble — следим за таймерами вручную"));
   }
 
   const bool needLdro = (symbolDurationMs >= 16.0f);
-  if constexpr (radiolib_features::HasSetLowDataRateOptimization<SX1262>::value) {
-    if (needLdro != state.rxTiming.ldroForced) {
-      const int16_t code = radio.setLowDataRateOptimization(needLdro);
-      if (code == RADIOLIB_ERR_NONE) {
-        state.rxTiming.ldroForced = needLdro;
-        logRxTimingEvent(String("LDRO ") + (needLdro ? "включён" : "выключен") +
-                         String(" (Ts=") + String(symbolDurationMs, 2) + " мс)");
-      } else {
-        logRadioError("setLowDataRateOptimization", code);
+  if (needLdro != state.rxTiming.ldroForced) {
+    const int16_t code = radiolib_compat::setLowDataRateOptimizationIfSupported(radio, needLdro);
+    if (code == RADIOLIB_ERR_NONE) {
+      state.rxTiming.ldroForced = needLdro;
+      logRxTimingEvent(String("LDRO ") + (needLdro ? "включён" : "выключен") +
+                       String(" (Ts=") + String(symbolDurationMs, 2) + " мс)");
+    } else if (code == RADIOLIB_ERR_UNSUPPORTED) {
+      if (needLdro && !state.rxTiming.reportedMissingLdroSupport) {
+        state.rxTiming.reportedMissingLdroSupport = true;
+        logRxTimingEvent(
+            F("Нет API принудительного LDRO — убедитесь, что RadioLib активирует его сам"));
       }
+    } else {
+      logRadioError("setLowDataRateOptimization", code);
     }
-  } else if (needLdro && !state.rxTiming.reportedMissingLdroSupport) {
+  } else if (!kDirectLdroControlSupported && needLdro &&
+             !state.rxTiming.reportedMissingLdroSupport) {
     state.rxTiming.reportedMissingLdroSupport = true;
     logRxTimingEvent(F("Нет API принудительного LDRO — убедитесь, что RadioLib активирует его сам"));
   }
@@ -1047,59 +1143,79 @@ void configureNarrowbandRxOptions() {
       timeoutSymbols = 1U;
     }
   }
+  const uint32_t appliedSymbols = useContinuous ? 0U : timeoutSymbols;
+  const float timeoutSeconds = useContinuous ? 0.0f : (symbolDurationMs * timeoutSymbols) / 1000.0f;
 
-  if constexpr (radiolib_features::HasSetRxTimeoutSymbols<SX1262>::value) {
-    const uint32_t applied = useContinuous ? 0U : timeoutSymbols;
-    if (applied != state.rxTiming.rxTimeoutSymbols) {
-      const int16_t code = radio.setRxTimeout(applied);
+  bool timeoutConfigured = false;
+  const bool symbolsChangeNeeded =
+      (appliedSymbols != state.rxTiming.rxTimeoutSymbols) || (state.rxTiming.rxContinuous != useContinuous);
+  if (symbolsChangeNeeded) {
+    const int16_t code = radiolib_compat::setRxTimeoutSymbolsIfSupported(radio, appliedSymbols);
+    if (code == RADIOLIB_ERR_NONE) {
+      state.rxTiming.rxTimeoutSymbols = appliedSymbols;
+      state.rxTiming.rxContinuous = useContinuous;
+      if (useContinuous) {
+        logRxTimingEvent(F("RX переведён в непрерывный режим (SetRx timeout=0)"));
+      } else {
+        logRxTimingEvent(String("RX тайм-аут ≈ ") + String(timeoutSeconds, 2) + " с");
+      }
+      timeoutConfigured = true;
+    } else if (code == RADIOLIB_ERR_UNSUPPORTED) {
+      // попробуем fallback на секунды
+    } else {
+      logRadioError("setRxTimeout", code);
+      timeoutConfigured = true;
+    }
+  } else if (kRxTimeoutSymbolsSupported) {
+    // Значение уже применено и поддерживается — считаем, что настройка актуальна.
+    timeoutConfigured = true;
+  }
+
+  if (!timeoutConfigured) {
+    const bool shouldApplySeconds = useContinuous || needExtendedTimeout;
+    if (shouldApplySeconds) {
+      const int16_t code = radiolib_compat::setRxTimeoutSecondsIfSupported(radio, timeoutSeconds);
       if (code == RADIOLIB_ERR_NONE) {
-        state.rxTiming.rxTimeoutSymbols = applied;
+        state.rxTiming.rxTimeoutSymbols = appliedSymbols;
         state.rxTiming.rxContinuous = useContinuous;
         if (useContinuous) {
           logRxTimingEvent(F("RX переведён в непрерывный режим (SetRx timeout=0)"));
         } else {
-          const float timeoutSeconds = (symbolDurationMs * applied) / 1000.0f;
           logRxTimingEvent(String("RX тайм-аут ≈ ") + String(timeoutSeconds, 2) + " с");
         }
+        timeoutConfigured = true;
+      } else if (code == RADIOLIB_ERR_UNSUPPORTED) {
+        // оставим сообщение чуть ниже
       } else {
         logRadioError("setRxTimeout", code);
+        timeoutConfigured = true;
       }
     }
-  } else if constexpr (radiolib_features::HasSetRxTimeoutSeconds<SX1262>::value) {
-    const float timeoutSeconds = useContinuous ? 0.0f : (symbolDurationMs * timeoutSymbols) / 1000.0f;
-    const bool shouldApply = useContinuous || needExtendedTimeout;
-    if (shouldApply) {
-      const int16_t code = radio.setRxTimeout(timeoutSeconds);
-      if (code == RADIOLIB_ERR_NONE) {
-        state.rxTiming.rxTimeoutSymbols = useContinuous ? 0U : timeoutSymbols;
-        state.rxTiming.rxContinuous = useContinuous;
-        if (useContinuous) {
-          logRxTimingEvent(F("RX переведён в непрерывный режим (SetRx timeout=0)"));
-        } else {
-          logRxTimingEvent(String("RX тайм-аут ≈ ") + String(timeoutSeconds, 2) + " с");
-        }
-      } else {
-        logRadioError("setRxTimeout", code);
-      }
-    }
-  } else if (needExtendedTimeout && !state.rxTiming.reportedMissingRxTimeoutSupport) {
+  }
+
+  if (!timeoutConfigured && needExtendedTimeout && !state.rxTiming.reportedMissingRxTimeoutSupport) {
     state.rxTiming.reportedMissingRxTimeoutSupport = true;
     logRxTimingEvent(F("RadioLib не даёт выставить RX тайм-аут — окно нужно держать вручную"));
   }
 
-  if constexpr (radiolib_features::HasSetLoRaSymbNumTimeout<SX1262>::value) {
-    const uint16_t desired = static_cast<uint16_t>(std::min<uint32_t>(255U,
-                                                                      static_cast<uint32_t>(targetPreamble + 8U)));
-    if (desired != 0 && desired != state.rxTiming.symbTimeout) {
-      const int16_t code = radio.setLoRaSymbNumTimeout(static_cast<uint8_t>(desired));
-      if (code == RADIOLIB_ERR_NONE) {
-        state.rxTiming.symbTimeout = desired;
-        logRxTimingEvent(String("LoRaSymbNumTimeout установлен в ") + String(desired) + " символов");
-      } else {
-        logRadioError("setLoRaSymbNumTimeout", code);
+  const uint16_t desiredSymbTimeout = static_cast<uint16_t>(
+      std::min<uint32_t>(255U, static_cast<uint32_t>(targetPreamble + 8U)));
+  if (desiredSymbTimeout != 0 && desiredSymbTimeout != state.rxTiming.symbTimeout) {
+    const int16_t code = radiolib_compat::setLoRaSymbNumTimeoutIfSupported(
+        radio, static_cast<uint8_t>(desiredSymbTimeout));
+    if (code == RADIOLIB_ERR_NONE) {
+      state.rxTiming.symbTimeout = desiredSymbTimeout;
+      logRxTimingEvent(String("LoRaSymbNumTimeout установлен в ") + String(desiredSymbTimeout) + " символов");
+    } else if (code == RADIOLIB_ERR_UNSUPPORTED) {
+      if (narrowBandwidth && !state.rxTiming.reportedMissingSymbTimeoutSupport) {
+        state.rxTiming.reportedMissingSymbTimeoutSupport = true;
+        logRxTimingEvent(F("Нет доступа к LoRaSymbNumTimeout — оставляем поиск заголовка по умолчанию"));
       }
+    } else {
+      logRadioError("setLoRaSymbNumTimeout", code);
     }
-  } else if (narrowBandwidth && !state.rxTiming.reportedMissingSymbTimeoutSupport) {
+  } else if (!kLoRaSymbTimeoutSupported && narrowBandwidth &&
+             !state.rxTiming.reportedMissingSymbTimeoutSupport) {
     state.rxTiming.reportedMissingSymbTimeoutSupport = true;
     logRxTimingEvent(F("Нет доступа к LoRaSymbNumTimeout — оставляем поиск заголовка по умолчанию"));
   }
