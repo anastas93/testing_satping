@@ -99,6 +99,12 @@ struct DataBlock {
   uint8_t dataLength = 0;                         // фактическое число информационных байт
 };
 
+// --- Пакет паритета для восстановления одного потерянного DATA-блока ---
+struct ParityPacket {
+  DataBlock block;        // XOR всех DATA-блоков окна
+  uint8_t lengthXor = 0;  // XOR фактических длин DATA-блоков окна
+};
+
 // --- Структура, описывающая событие в веб-чате ---
 struct ChatEvent {
   unsigned long id = 0;   // уникальный идентификатор сообщения
@@ -119,6 +125,11 @@ struct RxWindowState {
   uint16_t receivedMask = 0;           // биты успешно принятых пакетов
   uint8_t windowSize = 0;              // фактическое количество пакетов в окне
   bool active = false;                 // инициализировано ли окно
+  bool parityValid = false;            // получен ли паритет для текущего окна
+  DataBlock parityBlock;               // сохранённый паритетный блок
+  uint8_t parityLengthXor = 0;         // XOR длин блоков в окне
+  unsigned long adaptiveAckTimeoutMs = 1000; // динамический тайм-аут ожидания ACK
+  unsigned long lastAckRttMs = 0;             // последнее измеренное RTT до ACK
 };
 
 struct RxMessageState {
@@ -408,7 +419,10 @@ bool transmitFrame(const std::array<uint8_t, kFixedFrameSize>& frame, const Stri
 void processIncomingFrame(const std::vector<uint8_t>& frame);
 void processIncomingDataFrame(const std::vector<uint8_t>& frame);
 void processIncomingAckFrame(const std::vector<uint8_t>& frame);
-void processIncomingParityFrame(const std::vector<uint8_t>& frame);
+void processIncomingParityFrame(uint16_t seq,
+                                uint8_t lengthField,
+                                bool ackRequest,
+                                const std::vector<uint8_t>& frame);
 void processIncomingFinFrame(const std::vector<uint8_t>& frame);
 void prepareAck(uint16_t seq, uint8_t windowSize, bool forceSend);
 void sendAck(uint16_t baseSeq, uint16_t missingBitmap, bool needParity, uint8_t windowSize);
@@ -427,7 +441,8 @@ std::vector<DataBlock> splitPayloadIntoBlocks(const std::vector<uint8_t>& payloa
 std::array<uint8_t, kFixedFrameSize> buildDataFrame(uint16_t seq,
                                                     const DataBlock& block,
                                                     bool ackRequest,
-                                                    bool isParity);
+                                                    bool isParity,
+                                                    uint8_t parityLengthXor = 0);
 std::array<uint8_t, kFixedFrameSize> buildAckFrame(uint16_t baseSeq,
                                                    uint16_t missingBitmap,
                                                    bool needParity,
@@ -435,6 +450,10 @@ std::array<uint8_t, kFixedFrameSize> buildAckFrame(uint16_t baseSeq,
 std::array<uint8_t, kFixedFrameSize> buildFinFrame(uint16_t length,
                                                    uint16_t crc,
                                                    bool harqUsed);
+ParityPacket computeWindowParity(const std::vector<DataBlock>& blocks,
+                                 size_t offset,
+                                 uint8_t windowSize);
+bool attemptParityRecovery();
 uint16_t crc16Ccitt(const uint8_t* data, size_t length, uint16_t crc = 0xFFFF);
 uint8_t crc8Dallas(const uint8_t* data, size_t length);
 void resetReceiveState();
@@ -446,6 +465,11 @@ void updateFhss();
 bool applyFhssHopByIndex(size_t hopIndex);
 bool advanceFhssIfDue();
 void waitInterFrameDelay();
+unsigned long computeInterFrameDelayMs();
+float estimateLoRaAirTimeMs(uint8_t payloadSize, uint16_t preambleSymbols);
+unsigned long computeAckTimeoutMs(uint8_t windowSize);
+void updateAckTiming(unsigned long measuredRttMs);
+void handleAckTimeoutExpansion();
 String formatByteArray(const std::vector<uint8_t>& data);
 String formatTextPayload(const std::vector<uint8_t>& data);
 void configureNarrowbandRxOptions();
@@ -1536,7 +1560,25 @@ bool sendPayload(const std::vector<uint8_t>& payload, const String& context) {
     if (needParity) {
       if (state.protocol.harq) {
         harqUsed = true;
-        addEvent("Получен запрос HARQ: генерация PAR пока не реализована (TODO)");
+        addEvent("Получен запрос HARQ: отправляем дополнительный паритет");
+        const ParityPacket parity = computeWindowParity(blocks, offset, windowSize);
+        auto parityFrame = buildDataFrame(static_cast<uint16_t>(windowBaseSeq + windowSize - 1),
+                                          parity.block,
+                                          true,
+                                          true,
+                                          parity.lengthXor);
+        if (!transmitFrame(parityFrame, F("PARITY retry"))) {
+          return false;
+        }
+        waitInterFrameDelay();
+        if (!waitForAck(windowBaseSeq, windowSize, missingBitmap, needParity)) {
+          addEvent("ACK после HARQ не получен — прекращаем передачу окна");
+          return false;
+        }
+        if (missingBitmap != 0) {
+          addEvent("HARQ не помог — окно всё ещё неполное");
+          return false;
+        }
       } else {
         addEvent("Получен запрос HARQ, но HARQ отключён");
       }
@@ -1580,6 +1622,8 @@ bool sendDataWindow(const std::vector<DataBlock>& blocks,
     order = std::move(interleaved);
   }
 
+  const bool parityEnabled = state.protocol.harq && windowSize > 0;
+
   for (size_t idx : order) {
     if (idx >= windowSize) {
       continue;
@@ -1588,9 +1632,25 @@ bool sendDataWindow(const std::vector<DataBlock>& blocks,
     if (blockIndex >= blocks.size()) {
       break;
     }
-    const bool ackRequest = (idx == windowSize - 1);
-    auto frame = buildDataFrame(static_cast<uint16_t>(baseSeq + idx), blocks[blockIndex], ackRequest, false);
+    const bool ackRequest = (!parityEnabled && idx == windowSize - 1);
+    auto frame = buildDataFrame(static_cast<uint16_t>(baseSeq + idx),
+                                blocks[blockIndex],
+                                ackRequest,
+                                false);
     if (!transmitFrame(frame, ackRequest ? F("DATA (ACK)") : F("DATA"))) {
+      return false;
+    }
+    waitInterFrameDelay();
+  }
+
+  if (parityEnabled && windowSize > 0) {
+    const ParityPacket parity = computeWindowParity(blocks, offset, windowSize);
+    auto parityFrame = buildDataFrame(static_cast<uint16_t>(baseSeq + windowSize - 1),
+                                      parity.block,
+                                      true,
+                                      true,
+                                      parity.lengthXor);
+    if (!transmitFrame(parityFrame, F("PARITY"))) {
       return false;
     }
     waitInterFrameDelay();
@@ -1601,7 +1661,7 @@ bool sendDataWindow(const std::vector<DataBlock>& blocks,
 
 // --- Ожидание ACK ---
 bool waitForAck(uint16_t baseSeq, uint8_t windowSize, uint16_t& missingBitmap, bool& needParity) {
-  const unsigned long timeoutMs = 1000;
+  const unsigned long timeoutMs = computeAckTimeoutMs(windowSize);
   const unsigned long start = millis();
   while (millis() - start < timeoutMs) {
     processRadioEvents();
@@ -1614,6 +1674,7 @@ bool waitForAck(uint16_t baseSeq, uint8_t windowSize, uint16_t& missingBitmap, b
                  " вместо ожидаемых " + String(windowSize));
       }
       state.pendingAck.hasValue = false;
+      updateAckTiming(millis() - start);
       return true;
     }
 #if defined(ARDUINO)
@@ -1622,6 +1683,7 @@ bool waitForAck(uint16_t baseSeq, uint8_t windowSize, uint16_t& missingBitmap, b
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
 #endif
   }
+  handleAckTimeoutExpansion();
   return false;
 }
 
@@ -1680,15 +1742,19 @@ bool transmitFrame(const std::array<uint8_t, kFixedFrameSize>& frame, const Stri
 std::array<uint8_t, kFixedFrameSize> buildDataFrame(uint16_t seq,
                                                     const DataBlock& block,
                                                     bool ackRequest,
-                                                    bool isParity) {
+                                                    bool isParity,
+                                                    uint8_t parityLengthXor) {
   std::array<uint8_t, kFixedFrameSize> frame{};
 
   const bool hasCrc = state.protocol.payloadCrc8;
-  uint8_t length = block.dataLength;
-  if (hasCrc && length < kFramePayloadSize) {
-    ++length; // добавляем байт CRC-8
+  uint8_t lengthField = block.dataLength;
+  if (!isParity && hasCrc && lengthField < kFramePayloadSize) {
+    ++lengthField; // добавляем байт CRC-8 только для DATA
   }
-  uint8_t flags = static_cast<uint8_t>((length << kDataFlagLengthShift) & kDataFlagLengthMask);
+  if (isParity) {
+    lengthField = std::min<uint8_t>(parityLengthXor & 0x0FU, 0x0FU); // для паритета поле несёт XOR длины
+  }
+  uint8_t flags = static_cast<uint8_t>((lengthField << kDataFlagLengthShift) & kDataFlagLengthMask);
   if (ackRequest) {
     flags |= kDataFlagAckRequest;
   }
@@ -1729,6 +1795,27 @@ std::array<uint8_t, kFixedFrameSize> buildFinFrame(uint16_t length,
   frame[3] = static_cast<uint8_t>(crc & 0xFFU);
   frame[4] = static_cast<uint8_t>((crc >> 8) & 0xFFU);
   return frame;
+}
+
+// --- Расчёт паритета по окну DATA-блоков ---
+ParityPacket computeWindowParity(const std::vector<DataBlock>& blocks,
+                                 size_t offset,
+                                 uint8_t windowSize) {
+  ParityPacket parity;
+  parity.block.dataLength = kFramePayloadSize;
+  for (uint8_t i = 0; i < windowSize; ++i) {
+    const size_t index = offset + i;
+    if (index >= blocks.size()) {
+      break;
+    }
+    const DataBlock& block = blocks[index];
+    parity.lengthXor ^= block.dataLength;
+    for (size_t byte = 0; byte < kFramePayloadSize; ++byte) {
+      const uint8_t value = (byte < block.dataLength) ? block.bytes[byte] : 0U;
+      parity.block.bytes[byte] ^= value;
+    }
+  }
+  return parity;
 }
 
 // --- Разбиение сообщения на DATA-блоки ---
@@ -1786,10 +1873,84 @@ uint8_t crc8Dallas(const uint8_t* data, size_t length) {
 // --- Пауза между кадрами ---
 void waitInterFrameDelay() {
 #if defined(ARDUINO)
-  delay(kInterFrameDelayMs);
+  delay(computeInterFrameDelayMs());
 #else
-  std::this_thread::sleep_for(std::chrono::milliseconds(kInterFrameDelayMs));
+  std::this_thread::sleep_for(std::chrono::milliseconds(computeInterFrameDelayMs()));
 #endif
+}
+
+// --- Динамический расчёт паузы между кадрами ---
+unsigned long computeInterFrameDelayMs() {
+  const float airtime = estimateLoRaAirTimeMs(static_cast<uint8_t>(kFixedFrameSize),
+                                             state.rxTiming.preambleSymbols);
+  if (!std::isfinite(airtime) || airtime <= 0.0f) {
+    return kInterFrameDelayMs;
+  }
+
+  const unsigned long guard = static_cast<unsigned long>(std::ceil(airtime * 0.2f));
+  unsigned long delayMs = std::max<unsigned long>(guard, 5UL);
+  if (state.rxWindow.lastAckRttMs > 0) {
+    delayMs = std::max<unsigned long>(delayMs, state.rxWindow.lastAckRttMs / 12U + 1U);
+  }
+  return std::clamp<unsigned long>(delayMs, 5U, kInterFrameDelayMs);
+}
+
+// --- Оценка времени передачи кадра LoRa ---
+float estimateLoRaAirTimeMs(uint8_t payloadSize, uint16_t preambleSymbols) {
+  const float bandwidthHz = state.radioBandwidthKhz * 1000.0f;
+  if (bandwidthHz <= 0.0f) {
+    return static_cast<float>(kInterFrameDelayMs);
+  }
+
+  const uint8_t sf = state.currentSpreadingFactor;
+  const float symbolDurationMs = static_cast<float>(std::pow(2.0f, sf)) / bandwidthHz * 1000.0f;
+  const bool ldro = (symbolDurationMs > 16.0f) || state.rxTiming.ldroForced;
+  const uint8_t de = ldro ? 1U : 0U;
+  const uint8_t ih = 0U;        // всегда явный заголовок
+  const uint8_t crcOn = 1U;     // аппаратный CRC включён
+  const uint8_t crDenom = kDefaultCodingRate;
+  const uint8_t cr = static_cast<uint8_t>(std::max<int>(static_cast<int>(crDenom) - 4, 1));
+
+  const int32_t numerator = static_cast<int32_t>(8 * payloadSize - 4 * sf + 28 + 16 * crcOn - 20 * ih);
+  const int32_t denominator = static_cast<int32_t>(4 * (sf - 2 * de));
+  float payloadSymbols = 8.0f;
+  if (denominator > 0) {
+    const float fraction = std::max<float>(static_cast<float>(numerator), 0.0f) / static_cast<float>(denominator);
+    payloadSymbols = 8.0f + std::ceil(fraction) * static_cast<float>(cr + 4U);
+  }
+
+  const float preambleMs = (static_cast<float>(preambleSymbols) + 4.25f) * symbolDurationMs;
+  const float payloadMs = payloadSymbols * symbolDurationMs;
+  return preambleMs + payloadMs;
+}
+
+// --- Расчёт тайм-аута ожидания ACK ---
+unsigned long computeAckTimeoutMs(uint8_t windowSize) {
+  const float ackAirTime = estimateLoRaAirTimeMs(static_cast<uint8_t>(kFixedFrameSize),
+                                                 state.rxTiming.preambleSymbols);
+  const unsigned long airGuard = static_cast<unsigned long>(std::ceil(ackAirTime)) + 40U;
+  const unsigned long windowGuard = static_cast<unsigned long>(windowSize) * 12U;
+  const unsigned long adaptive = state.rxWindow.adaptiveAckTimeoutMs;
+  return std::max<unsigned long>({150UL, airGuard + windowGuard, adaptive});
+}
+
+// --- Обновление статистики ожидания ACK ---
+void updateAckTiming(unsigned long measuredRttMs) {
+  state.rxWindow.lastAckRttMs = measuredRttMs;
+  const float ackAirTime = estimateLoRaAirTimeMs(static_cast<uint8_t>(kFixedFrameSize),
+                                                 state.rxTiming.preambleSymbols);
+  const unsigned long target = std::max<unsigned long>(
+      static_cast<unsigned long>(std::ceil(ackAirTime)) + 40U,
+      measuredRttMs + 20U);
+  constexpr float kAlpha = 0.3f;
+  const float updated = static_cast<float>(state.rxWindow.adaptiveAckTimeoutMs) * (1.0f - kAlpha) +
+                        static_cast<float>(target) * kAlpha;
+  state.rxWindow.adaptiveAckTimeoutMs = static_cast<unsigned long>(std::clamp(updated, 150.0f, 2000.0f));
+}
+
+// --- Реакция на истечение тайм-аута ACK ---
+void handleAckTimeoutExpansion() {
+  state.rxWindow.adaptiveAckTimeoutMs = std::min<unsigned long>(state.rxWindow.adaptiveAckTimeoutMs + 120U, 2000U);
 }
 
 // --- Формирование текстового представления полезной нагрузки ---
@@ -1861,7 +2022,18 @@ void processIncomingFrame(const std::vector<uint8_t>& frame) {
       processIncomingAckFrame(frame);
       break;
     case kFrameTypeParity:
-      processIncomingParityFrame(frame);
+      {
+        const uint8_t lengthField = (frame.empty())
+                                        ? 0
+                                        : static_cast<uint8_t>((frame[0] & kDataFlagLengthMask) >>
+                                                               kDataFlagLengthShift);
+        const bool ackRequest = !frame.empty() && ((frame[0] & kDataFlagAckRequest) != 0);
+        const uint16_t seq = (frame.size() >= 3)
+                                 ? static_cast<uint16_t>(frame[1]) |
+                                       (static_cast<uint16_t>(frame[2]) << 8)
+                                 : 0;
+        processIncomingParityFrame(seq, lengthField, ackRequest, frame);
+      }
       break;
     case kFrameTypeFin:
       processIncomingFinFrame(frame);
@@ -1885,17 +2057,20 @@ void processIncomingDataFrame(const std::vector<uint8_t>& frame) {
   const bool ackRequest = (flags & kDataFlagAckRequest) != 0;
   const bool isParity = (flags & kDataFlagIsParity) != 0;
 
-  if (isParity) {
-    processIncomingParityFrame(frame);
-    return;
-  }
-
   if (!state.rxWindow.active || seq < state.rxWindow.baseSeq ||
       seq >= static_cast<uint16_t>(state.rxWindow.baseSeq + kBitmapWidth)) {
     state.rxWindow.active = true;
     state.rxWindow.baseSeq = static_cast<uint16_t>(seq - (seq % kArqWindowSize));
     state.rxWindow.receivedMask = 0;
     state.rxWindow.windowSize = 0;
+    state.rxWindow.parityValid = false;
+    state.rxWindow.parityBlock = {};
+    state.rxWindow.parityLengthXor = 0;
+  }
+
+  if (isParity) {
+    processIncomingParityFrame(seq, lengthField, ackRequest, frame);
+    return;
   }
 
   const uint8_t bit = static_cast<uint8_t>(seq - state.rxWindow.baseSeq);
@@ -1940,6 +2115,10 @@ void processIncomingDataFrame(const std::vector<uint8_t>& frame) {
   state.rxMessage.pending[seq] = block;
   flushPendingData();
 
+  if (state.rxWindow.parityValid && attemptParityRecovery()) {
+    addEvent("Потерянный DATA-блок восстановлен по паритету");
+  }
+
   if (ackRequest) {
     const uint8_t windowCount = static_cast<uint8_t>(std::max<uint8_t>(state.rxWindow.windowSize, bit + 1));
     prepareAck(seq, windowCount, true);
@@ -1965,9 +2144,87 @@ void processIncomingAckFrame(const std::vector<uint8_t>& frame) {
 }
 
 // --- Обработка PAR-кадра (пока заглушка) ---
-void processIncomingParityFrame(const std::vector<uint8_t>& frame) {
-  (void)frame;
-  addEvent("Получен PAR-кадр — HARQ пока не реализован (TODO)");
+void processIncomingParityFrame(uint16_t seq,
+                                uint8_t lengthField,
+                                bool ackRequest,
+                                const std::vector<uint8_t>& frame) {
+  if (frame.size() < 3) {
+    addEvent("Получен усечённый PAR-кадр");
+    return;
+  }
+
+  const size_t payloadAvailable = std::min<size_t>(kFramePayloadSize, frame.size() - 3);
+  std::copy_n(frame.begin() + 3, payloadAvailable, state.rxWindow.parityBlock.bytes.begin());
+  if (payloadAvailable < kFramePayloadSize) {
+    std::fill(state.rxWindow.parityBlock.bytes.begin() + payloadAvailable,
+              state.rxWindow.parityBlock.bytes.end(),
+              0U);
+  }
+  state.rxWindow.parityBlock.dataLength = kFramePayloadSize;
+  state.rxWindow.parityLengthXor = lengthField;
+  state.rxWindow.parityValid = true;
+
+  addEvent(String("Получен паритет по окну base=") + String(state.rxWindow.baseSeq) +
+           ", xorLen=" + String(static_cast<unsigned long>(lengthField)));
+
+  if (attemptParityRecovery()) {
+    addEvent("Потерянный DATA-блок восстановлен по паритету");
+  }
+
+  if (ackRequest) {
+    const uint8_t expectedCount = static_cast<uint8_t>(std::max<uint8_t>(
+        state.rxWindow.windowSize,
+        (seq >= state.rxWindow.baseSeq)
+            ? static_cast<uint8_t>((seq - state.rxWindow.baseSeq) + 1)
+            : state.rxWindow.windowSize));
+    prepareAck(seq, expectedCount, true);
+  }
+}
+
+// --- Попытка восстановить единственный потерянный блок окна ---
+bool attemptParityRecovery() {
+  if (!state.rxWindow.parityValid || state.rxWindow.windowSize == 0) {
+    return false;
+  }
+
+  const uint8_t windowCount = state.rxWindow.windowSize;
+  const uint16_t mask = static_cast<uint16_t>((windowCount >= kBitmapWidth)
+                                                  ? kBitmapFullMask
+                                                  : ((1U << windowCount) - 1U));
+  const uint16_t missingMask = static_cast<uint16_t>((~state.rxWindow.receivedMask) & mask);
+  if (missingMask == 0 || __builtin_popcount(missingMask) != 1) {
+    return false; // либо всё доставлено, либо потерь несколько
+  }
+
+  const uint8_t missingBit = static_cast<uint8_t>(__builtin_ctz(missingMask));
+  const uint16_t missingSeq = static_cast<uint16_t>(state.rxWindow.baseSeq + missingBit);
+
+  DataBlock recovered = state.rxWindow.parityBlock;
+  uint8_t missingLength = state.rxWindow.parityLengthXor;
+
+  for (uint8_t bit = 0; bit < windowCount; ++bit) {
+    if (bit == missingBit) {
+      continue;
+    }
+    const uint16_t seq = static_cast<uint16_t>(state.rxWindow.baseSeq + bit);
+    auto it = state.rxMessage.pending.find(seq);
+    if (it == state.rxMessage.pending.end()) {
+      return false; // ждём остальные кадры окна
+    }
+    const DataBlock& known = it->second;
+    for (size_t byte = 0; byte < kFramePayloadSize; ++byte) {
+      recovered.bytes[byte] ^= known.bytes[byte];
+    }
+    missingLength ^= known.dataLength;
+  }
+
+  recovered.dataLength = std::min<uint8_t>(missingLength, static_cast<uint8_t>(kFramePayloadSize));
+  state.rxMessage.pending[missingSeq] = recovered;
+  state.rxWindow.receivedMask |= static_cast<uint16_t>(1U << missingBit);
+  state.rxWindow.parityValid = false;
+
+  flushPendingData();
+  return true;
 }
 
 // --- Обработка FIN-кадра ---
@@ -1999,7 +2256,7 @@ void prepareAck(uint16_t /*seq*/, uint8_t windowSize, bool forceSend) {
   uint16_t mask = static_cast<uint16_t>((effectiveWindow >= kBitmapWidth) ? kBitmapFullMask
                                                                          : ((1U << effectiveWindow) - 1U));
   const uint16_t missing = static_cast<uint16_t>((~state.rxWindow.receivedMask) & mask);
-  const bool needParity = false; // TODO: оценка необходимости HARQ на приёме
+  const bool needParity = (state.protocol.harq && missing != 0);
   if (!forceSend && missing == 0) {
     return;
   }
@@ -2008,6 +2265,9 @@ void prepareAck(uint16_t /*seq*/, uint8_t windowSize, bool forceSend) {
   state.rxWindow.baseSeq = static_cast<uint16_t>(base + effectiveWindow);
   state.rxWindow.receivedMask = 0;
   state.rxWindow.windowSize = 0;
+  state.rxWindow.parityValid = false;
+  state.rxWindow.parityBlock = {};
+  state.rxWindow.parityLengthXor = 0;
 }
 
 void sendAck(uint16_t baseSeq, uint16_t missingBitmap, bool needParity, uint8_t windowSize) {
