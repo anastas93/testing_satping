@@ -2091,6 +2091,23 @@ String formatByteArray(const std::vector<uint8_t>& data) {
   return out;
 }
 
+// --- Формирование строки статуса оконных пакетов вида |✅|⛔️| ---
+String formatWindowReceptionStatus(uint16_t receivedMask, uint8_t windowSize) {
+  if (windowSize == 0) {
+    return String('|');
+  }
+
+  String status;
+  status.reserve(static_cast<size_t>(windowSize) * 5U);
+  for (uint8_t bit = 0; bit < windowSize; ++bit) {
+    status += '|';
+    const bool received = (receivedMask & (1U << bit)) != 0U;
+    status += received ? F("✅") : F("⛔️");
+  }
+  status += '|';
+  return status;
+}
+
 // --- Логирование принятого сообщения ---
 void logReceivedMessage(const std::vector<uint8_t>& payload) {
   addEvent(String("Принято сообщение (") + String(static_cast<unsigned long>(payload.size())) + " байт): " +
@@ -2382,6 +2399,8 @@ void prepareAck(uint16_t /*seq*/, uint8_t windowSize, bool forceSend) {
     return;
   }
   const uint16_t base = state.rxWindow.baseSeq;
+  const String windowStatus = formatWindowReceptionStatus(state.rxWindow.receivedMask, effectiveWindow);
+  addEvent(String("Статус пакетов окна base=") + String(base) + ": " + windowStatus);
   sendAck(base, missing, needParity, effectiveWindow);
   state.rxWindow.baseSeq = static_cast<uint16_t>(base + effectiveWindow);
   state.rxWindow.receivedMask = 0;
