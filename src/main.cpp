@@ -181,7 +181,7 @@ constexpr size_t kMaxFhssHops = 32; // максимальное количест
 
 struct FhssConfig {
   bool enabled = false;                                              // включён ли программный FHSS
-  unsigned long dwellTimeMs = 250;                                   // длительность стоянки на одном прыжке
+  unsigned long dwellTimeMs = 80;                                   // длительность стоянки на одном прыжке
   std::array<FhssHop, kMaxFhssHops> hopSequence{};                   // последовательность прыжков с учётом смещений
   size_t hopCount = 0;                                               // фактическое количество активных шагов
   size_t currentHopIndex = 0;                                        // индекс текущего прыжка в массиве
