@@ -188,6 +188,8 @@ struct RxTimingDiagnostics {
   bool forceContinuousRx = true;                  // временно держим приёмник в бесконечном SetRx для диагностики
   bool rxContinuous = false;                      // удалось ли перевести в непрерывный режим
   bool ldroForced = false;                        // включена ли принудительная оптимизация LDRO
+  bool ldroOverrideActive = false;               // ручное управление LDRO активно
+  bool ldroOverrideValue = false;                // целевое значение LDRO при ручном управлении
   unsigned long lastSetRxMs = 0;                  // отметка времени последнего SetRx
   unsigned long lastSetRxLogMs = 0;               // отметка времени последнего логирования SetRx (для подавления спама)
   bool reportedMissingStopTimerSupport = false;   // уже сообщали об отсутствии API StopRxTimerOnPreamble
@@ -272,6 +274,7 @@ void handleProtocolToggle();
 void handleSpreadingFactorChange();
 void handleFhssToggle();
 void handleTcxoConfig();
+void handleLdroToggle();
 String buildIndexHtml();
 String buildChannelOptions(uint8_t selected);
 String escapeJson(const String& value);
@@ -491,6 +494,7 @@ void setup() {
   server.on("/api/sf", HTTP_POST, handleSpreadingFactorChange);
   server.on("/api/fhss", HTTP_POST, handleFhssToggle);
   server.on("/api/tcxo", HTTP_POST, handleTcxoConfig);
+  server.on("/api/ldro", HTTP_POST, handleLdroToggle);
   server.on("/api/implicit", HTTP_POST, handleImplicitLenChange);
   server.on("/api/protocol", HTTP_POST, handleProtocolToggle);
   server.onNotFound(handleNotFound);
@@ -810,6 +814,40 @@ void handleFhssToggle() {
   }
 }
 
+// --- API: ручное управление LDRO ---
+void handleLdroToggle() {
+  bool handled = false;
+  if (server.hasArg("auto") && server.arg("auto") == "1") {
+    state.rxTiming.ldroOverrideActive = false;
+    handled = true;
+  }
+  if (server.hasArg("on")) {
+    bool en = (server.arg("on") == "1");
+    state.rxTiming.ldroOverrideActive = true;
+    state.rxTiming.ldroOverrideValue = en;
+    int16_t rc = radio.setLowDataRateOptimization(en);
+    if (rc != RADIOLIB_ERR_NONE) {
+      logRadioError("setLowDataRateOptimization", rc);
+      server.send(500, "application/json", "{\"error\":\"Не удалось применить LDRO\"}");
+      return;
+    }
+    state.rxTiming.ldroForced = en;
+    handled = true;
+  }
+
+  if (!handled) {
+    server.send(400, "application/json", "{\"error\":\"Параметры не переданы\"}");
+    return;
+  }
+
+  configureNarrowbandRxOptions();
+  ensureReceiveMode();
+  addEvent(String("LDRO ") + (state.rxTiming.ldroOverrideActive
+                               ? String(state.rxTiming.ldroOverrideValue ? "принудительно включён" : "принудительно выключен")
+                               : String("в режиме AUTO")));
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 // --- API: конфигурация TCXO (вкл/выкл и напряжение) ---
 void handleTcxoConfig() {
   const bool enable = server.hasArg("enable") && server.arg("enable") == "1";
@@ -1037,6 +1075,12 @@ String buildIndexHtml() {
     html += " checked";
   }
   html += "> PHY FEC (LoRa CR=4/7)</label>";
+  // Принудительное управление LDRO: чекбокс включает LDRO, снятие — авто
+  html += "<label><input type='checkbox' id='ldro'";
+  if (state.rxTiming.ldroOverrideActive && state.rxTiming.ldroOverrideValue) {
+    html += " checked";
+  }
+  html += "> LDRO (принудительно; снято = AUTO)</label>";
   html += "<label><input type='checkbox' id='crc8'";
   if (state.protocol.payloadCrc8) {
     html += " checked";
@@ -1058,7 +1102,7 @@ String buildIndexHtml() {
   html += F("</div></section>");
 
   html += F("<section><h2>Журнал событий</h2><div id='log'></div></section></main><script>");
-  html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfSelect=document.getElementById('sf');const fhssCb=document.getElementById('fhss');const symCb=document.getElementById('sym');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const statusEl=document.getElementById('status');let lastId=0;");
+  html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfSelect=document.getElementById('sf');const fhssCb=document.getElementById('fhss');const symCb=document.getElementById('sym');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const ldroCb=document.getElementById('ldro');const statusEl=document.getElementById('status');let lastId=0;");
   html += F("function appendLog(entry){const div=document.createElement('div');div.className='message';div.textContent=entry.text;if(entry.color){div.style.color=entry.color;}logEl.appendChild(div);logEl.scrollTop=logEl.scrollHeight;}");
   html += F("async function refreshLog(){try{const resp=await fetch(`/api/log?after=${lastId}`);if(!resp.ok)return;const data=await resp.json();data.events.forEach(evt=>{appendLog(evt);lastId=evt.id;});}catch(e){console.error(e);}}");
   html += F("async function postForm(url,body){const resp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(body)});if(!resp.ok){const err=await resp.json().catch(()=>({error:'Неизвестная ошибка'}));throw new Error(err.error||'Ошибка');}}");
@@ -1072,6 +1116,7 @@ String buildIndexHtml() {
   html += F("interCb.addEventListener('change',()=>{updateProtocol('interleaving',interCb.checked);});");
   html += F("harqCb.addEventListener('change',()=>{updateProtocol('harq',harqCb.checked);});");
   html += F("phyFecCb.addEventListener('change',()=>{updateProtocol('phyfec',phyFecCb.checked);});");
+  html += F("ldroCb.addEventListener('change',async()=>{try{if(ldroCb.checked){await postForm('/api/ldro',{on:'1'});}else{await postForm('/api/ldro',{auto:'1'});}statusEl.textContent='LDRO обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("crc8Cb.addEventListener('change',()=>{updateProtocol('crc8',crc8Cb.checked);});");
   html += F("document.getElementById('sendLong').addEventListener('click',async()=>{try{await postForm('/api/send/long',{});statusEl.textContent='Длинный пакет отправлен';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("document.getElementById('sendRandom').addEventListener('click',async()=>{try{await postForm('/api/send/random',{});statusEl.textContent='Полный пакет отправлен';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
@@ -1355,13 +1400,15 @@ void configureNarrowbandRxOptions() {
     }
   }
 
-  const bool needLdro = (symbolDurationMs >= 16.0f);
+  const bool computedLdro = (symbolDurationMs >= 16.0f);
+  const bool needLdro = state.rxTiming.ldroOverrideActive ? state.rxTiming.ldroOverrideValue : computedLdro;
   if (needLdro != state.rxTiming.ldroForced) {
     const int16_t code = radio.setLowDataRateOptimization(needLdro);
     if (code == RADIOLIB_ERR_NONE) {
       state.rxTiming.ldroForced = needLdro;
+      String src = state.rxTiming.ldroOverrideActive ? String(" (manual)") : String("");
       logRxTimingEvent(String("LDRO ") + (needLdro ? "включён" : "выключен") +
-                       String(" (Ts=") + String(symbolDurationMs, 2) + " мс)");
+                       String(" (Ts=") + String(symbolDurationMs, 2) + " мс)") + src;
     } else {
       logRadioError("setLowDataRateOptimization", code);
     }
