@@ -16,8 +16,8 @@ struct SX1262DriverOptions {
   int8_t lowPowerDbm = -5;            // Низкий уровень мощности передачи (dBm) для щадящего режима.
   int8_t highPowerDbm = 22;           // Высокий уровень мощности передачи (dBm) для максимальной дальности.
   bool useDio2AsRfSwitch = true;      // Включение аппаратного RF-переключателя на выводе DIO2.
-  bool useDio3ForTcxo = false;        // Разрешение питания внешнего TCXO через вывод DIO3.
-  float tcxoVoltage = 0.0f;           // Напряжение питания TCXO (В). Значение 0 отключает управление TCXO.
+  bool useDio3ForTcxo = true;         // Включаем питание внешнего TCXO через DIO3 (типично для модулей SX1262).
+  float tcxoVoltage = 1.8f;           // Типовое напряжение TCXO (В). Уточните по даташиту модуля (1.6–3.0 В).
   bool enableRegulatorLDO = true;     // Принудительный перевод радиочасти в режим LDO-регулятора.
   bool enableRegulatorDCDC = false;   // Принудительный перевод радиочасти в режим DC-DC (если поддерживается аппаратно).
   bool autoLdro = true;               // Автоматический выбор оптимизации для низких скоростей передачи (LDRO).

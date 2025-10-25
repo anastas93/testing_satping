@@ -69,7 +69,9 @@ constexpr size_t kMaxEventHistory = 120;          // ограничение ис
 constexpr size_t kFullPacketSize = 245;           // максимальная длина пакета SX1262
 constexpr size_t kFixedFrameSize = 8;             // фиксированная длина кадра LoRa
 constexpr size_t kFramePayloadSize = 5;           // полезная часть кадра согласно спецификации ARQ
-constexpr unsigned long kInterFrameDelayMs = 25;  // пауза между кадрами в базовом режиме
+constexpr size_t kPartCountFieldSize = 2;         // число байт, которыми кодируется количество частей
+constexpr size_t kPartCountMetadataBytes = kPartCountFieldSize * 2; // метаданные хранятся в первом и последнем пакете
+constexpr unsigned long kInterFrameDelayMs = 8;   // пауза между кадрами (снижена для ускорения)
 constexpr size_t kArqWindowSize = 8;              // размер окна подтверждения ACK
 constexpr size_t kBitmapWidth = 16;               // ширина BITMAP16 для запроса переотправки
 constexpr uint16_t kBitmapFullMask = (1U << kBitmapWidth) - 1U; // полный набор битов BITMAP16
@@ -97,6 +99,23 @@ constexpr uint8_t kAckTypeSuccess = 0x01;         // тип ACK: все паке
 constexpr uint8_t kAckTypeMissing = 0x02;         // тип ACK: присутствуют потери, требуется переотправка
 
 constexpr uint8_t kFinFlagHarqUsed = 0x01;        // в ходе передачи использовался HARQ
+
+// Магическая сигнатура «стартового» кадра управления (DATA с особой полезной нагрузкой)
+constexpr std::array<uint8_t, kFramePayloadSize> kStartMagic = {0xA5, 0x5A, 0xC3, 0x3C, 0x7E};
+
+// Кодирование SEQ: старшие 4 бита — идентификатор сообщения, младшие 12 — порядковый номер части
+constexpr uint16_t kSeqPartMask = 0x0FFFU;
+constexpr uint8_t  kSeqMsgIdShift = 12U;
+inline uint16_t composeSeq(uint8_t msgId, uint16_t part) {
+  return static_cast<uint16_t>((static_cast<uint16_t>(msgId & 0x0F) << kSeqMsgIdShift) |
+                               (part & kSeqPartMask));
+}
+inline uint8_t extractMsgId(uint16_t seq) {
+  return static_cast<uint8_t>((seq >> kSeqMsgIdShift) & 0x0F);
+}
+inline uint16_t extractPart(uint16_t seq) {
+  return static_cast<uint16_t>(seq & kSeqPartMask);
+}
 
 struct DataBlock {
   std::array<uint8_t, kFramePayloadSize> bytes{}; // полезная нагрузка DATA-пакета
@@ -144,6 +163,11 @@ struct RxMessageState {
   uint16_t declaredLength = 0;         // ожидаемая длина файла из FIN
   uint16_t declaredCrc = 0;            // ожидаемый CRC-16 из FIN
   bool finReceived = false;            // получен ли FIN
+  uint16_t announcedPartCount = 0;     // заявленное количество частей
+  bool partCountFromPrefix = false;    // метаданные первой части обработаны
+  bool partCountFromSuffix = false;    // метаданные последней части обработаны
+  unsigned long lastActivityMs = 0;    // время последней активности (принят DATA/PAR/FIN)
+  unsigned long lastProgressMs = 0;    // время последнего продвижения (собран следующий SEQ)
 };
 
 struct AckNotification {
@@ -172,6 +196,12 @@ struct RxTimingDiagnostics {
   bool reportedMissingLdroSupport = false;        // уже сообщали об отсутствии API принудительного LDRO
 };
 
+// Группа состояний приёма, ассоциированная с конкретным msgId
+struct PerMessageRx {
+  RxWindowState win;  // состояние окна для ACK/паритета
+  RxMessageState msg; // состояние сборки сообщения
+};
+
 struct FhssHop {
   uint8_t channel = 0;        // базовый канал HOME для прыжка
   float offsetKhz = 0.0f;     // дополнительное смещение частоты в килогерцах
@@ -192,6 +222,7 @@ struct FhssConfig {
   unsigned long lastHopMillis = 0;                                   // отметка времени последнего переключения частоты
   bool limitToTenKhz = true;                                         // ограничивать прыжки диапазоном ±5 кГц
   uint8_t baseChannelForTenKhz = 0;                                  // базовый канал для узкополосного FHSS
+  uint8_t suspendDepth = 0;                                          // глубина временной заморозки прыжков
 };
 
 struct AppState {
@@ -200,6 +231,7 @@ struct AppState {
   uint8_t selectedSpreadingFactor = kDefaultSpreadingFactor; // выбранный пользователем SF
   float currentRxFreq = frequency_tables::RX_HOME[0]; // текущая частота приёма
   float currentTxFreq = frequency_tables::TX_HOME[0]; // текущая частота передачи
+  bool symmetricTxRx = true;           // лабораторный режим: TX = RX (без транспондера)
   unsigned long nextEventId = 1;       // счётчик идентификаторов для событий
   std::vector<ChatEvent> events;       // журнал событий для веб-интерфейса
   ProtocolConfig protocol;             // параметры протокола Lotest
@@ -211,6 +243,9 @@ struct AppState {
   uint8_t currentSpreadingFactor = kDefaultSpreadingFactor; // фактический SF
   RxTimingDiagnostics rxTiming;        // состояние тайминговых оптимизаций
   FhssConfig fhss;                     // параметры программного частотного прыжкового режима
+  size_t implicitPayloadLength = kImplicitPayloadLength; // актуальная длина фиксированного LoRa-пакета
+  uint8_t nextMessageId = 0;           // идентификатор для следующего исходящего сообщения (0..15)
+  std::map<uint8_t, PerMessageRx> rxSessions; // параллельные сборки по msgId
 } state;
 
 // --- Флаги приёма LoRa ---
@@ -218,190 +253,7 @@ volatile bool packetReceivedFlag = false;   // устанавливается о
 volatile bool packetProcessingEnabled = true; // защита от повторного входа в обработчик
 volatile bool irqStatusPending = false;     // есть ли необработанные IRQ-флаги SX1262
 
-// --- Совместимость с различными версиями API RadioLib ---
-namespace radiolib_compat {
-
-// Проверяем доступность старого API getIrqFlags()/clearIrqFlags()
-template <typename T, typename = void>
-struct HasIrqFlagsApi : std::false_type {};
-
-template <typename T>
-struct HasIrqFlagsApi<
-    T,
-    std::void_t<decltype(std::declval<T&>().getIrqFlags()),
-                decltype(std::declval<T&>().clearIrqFlags(RADIOLIB_SX126X_IRQ_ALL))>>
-    : std::true_type {};
-
-// Проверяем наличие современного варианта getIrqStatus() без аргументов
-template <typename T, typename = void>
-struct HasZeroArgIrqStatusApi : std::false_type {};
-
-template <typename T>
-struct HasZeroArgIrqStatusApi<
-    T,
-    std::void_t<decltype(std::declval<T&>().getIrqStatus())>> : std::true_type {};
-
-// Проверяем наличие варианта getIrqStatus(uint16_t*)
-template <typename T, typename = void>
-struct HasPointerIrqStatusApi : std::false_type {};
-
-template <typename T>
-struct HasPointerIrqStatusApi<
-    T,
-    std::void_t<decltype(
-        std::declval<T&>().getIrqStatus(static_cast<uint16_t*>(nullptr)))>>
-    : std::true_type {};
-
-// Унифицированное чтение IRQ-флагов SX1262
-template <typename Radio>
-uint32_t readIrqFlags(Radio& radio) {
-  if constexpr (HasIrqFlagsApi<Radio>::value) {
-    return radio.getIrqFlags();                                  // старый API RadioLib
-  } else if constexpr (HasZeroArgIrqStatusApi<Radio>::value) {
-    return static_cast<uint32_t>(radio.getIrqStatus());          // новый API без аргументов
-  } else if constexpr (HasPointerIrqStatusApi<Radio>::value) {
-    uint16_t legacyFlags = 0;
-    const int16_t state = radio.getIrqStatus(&legacyFlags);      // fallback через указатель
-    return (state == RADIOLIB_ERR_NONE) ? legacyFlags : 0U;
-  } else {
-    return 0U;                                                   // неподдерживаемый вариант API
-  }
-}
-
-// Унифицированная очистка IRQ-флагов SX1262
-template <typename Radio>
-int16_t clearIrqFlags(Radio& radio, uint32_t mask) {
-  if constexpr (HasIrqFlagsApi<Radio>::value) {
-    return radio.clearIrqFlags(mask);                            // старый API
-  } else {
-    (void)mask;
-    return radio.clearIrqStatus();                               // современный API без аргументов
-  }
-}
-} // namespace radiolib_compat
-
-// --- Проверки наличия специфичных методов RadioLib для настройки таймингов ---
-namespace radiolib_features {
-
-template <typename T, typename = void>
-struct HasSetStopRxTimerOnPreamble : std::false_type {};
-
-template <typename T>
-struct HasSetStopRxTimerOnPreamble<
-    T,
-    std::void_t<decltype(std::declval<T&>().setStopRxTimerOnPreamble(true))>> : std::true_type {};
-
-template <typename T, typename = void>
-struct HasSetRxTimeoutSymbols : std::false_type {};
-
-template <typename T>
-struct HasSetRxTimeoutSymbols<
-    T,
-    std::void_t<decltype(std::declval<T&>().setRxTimeout(static_cast<uint32_t>(0)))>> : std::true_type {};
-
-template <typename T, typename = void>
-struct HasSetRxTimeoutSeconds : std::false_type {};
-
-template <typename T>
-struct HasSetRxTimeoutSeconds<
-    T,
-    std::void_t<decltype(std::declval<T&>().setRxTimeout(0.0f))>> : std::true_type {};
-
-template <typename T, typename = void>
-struct HasSetLoRaSymbNumTimeout : std::false_type {};
-
-template <typename T>
-struct HasSetLoRaSymbNumTimeout<
-    T,
-    std::void_t<decltype(std::declval<T&>().setLoRaSymbNumTimeout(static_cast<uint8_t>(0)))>>
-    : std::true_type {};
-
-template <typename T, typename = void>
-struct HasSetLowDataRateOptimization : std::false_type {};
-
-template <typename T>
-struct HasSetLowDataRateOptimization<
-    T,
-    std::void_t<decltype(std::declval<T&>().setLowDataRateOptimization(true))>> : std::true_type {};
-
-template <typename T, typename = void>
-struct HasForceLdro : std::false_type {};
-
-template <typename T>
-struct HasForceLdro<
-    T,
-    std::void_t<decltype(std::declval<T&>().forceLDRO(true))>> : std::true_type {};
-
-template <typename T, typename = void>
-struct HasAutoLdro : std::false_type {};
-
-template <typename T>
-struct HasAutoLdro<
-    T,
-    std::void_t<decltype(std::declval<T&>().autoLDRO())>> : std::true_type {};
-
-} // namespace radiolib_features
-
-namespace radiolib_compat {
-
-template <typename Radio>
-int16_t setStopRxTimerOnPreambleIfSupported(Radio& radio, bool enable) {
-  if constexpr (radiolib_features::HasSetStopRxTimerOnPreamble<Radio>::value) {
-    return radio.setStopRxTimerOnPreamble(enable);
-  } else {
-    (void)radio;
-    (void)enable;
-    return RADIOLIB_ERR_UNSUPPORTED;
-  }
-}
-
-template <typename Radio>
-int16_t setLowDataRateOptimizationIfSupported(Radio& radio, bool enable) {
-  if constexpr (radiolib_features::HasSetLowDataRateOptimization<Radio>::value) {
-    return radio.setLowDataRateOptimization(enable);
-  } else if constexpr (radiolib_features::HasForceLdro<Radio>::value) {
-    return radio.forceLDRO(enable);
-  } else {
-    (void)radio;
-    (void)enable;
-    return RADIOLIB_ERR_UNSUPPORTED;
-  }
-}
-
-template <typename Radio>
-int16_t setRxTimeoutSymbolsIfSupported(Radio& radio, uint32_t symbols) {
-  if constexpr (radiolib_features::HasSetRxTimeoutSymbols<Radio>::value) {
-    return radio.setRxTimeout(symbols);
-  } else {
-    (void)radio;
-    (void)symbols;
-    return RADIOLIB_ERR_UNSUPPORTED;
-  }
-}
-
-template <typename Radio>
-int16_t setRxTimeoutSecondsIfSupported(Radio& radio, float seconds) {
-  if constexpr (radiolib_features::HasSetRxTimeoutSeconds<Radio>::value) {
-    return radio.setRxTimeout(seconds);
-  } else {
-    (void)radio;
-    (void)seconds;
-    return RADIOLIB_ERR_UNSUPPORTED;
-  }
-}
-
-template <typename Radio>
-int16_t setLoRaSymbNumTimeoutIfSupported(Radio& radio, uint8_t symbols) {
-  if constexpr (radiolib_features::HasSetLoRaSymbNumTimeout<Radio>::value) {
-    return radio.setLoRaSymbNumTimeout(symbols);
-  } else {
-    (void)radio;
-    (void)symbols;
-    return RADIOLIB_ERR_UNSUPPORTED;
-  }
-}
-
-} // namespace radiolib_compat
+// --- Поддержка RadioLib: используем современный API напрямую ---
 
 // --- Вспомогательные функции объявления ---
 void IRAM_ATTR onRadioDio1Rise();
@@ -419,10 +271,12 @@ void handleNotFound();
 void handleProtocolToggle();
 void handleSpreadingFactorChange();
 void handleFhssToggle();
+void handleTcxoConfig();
 String buildIndexHtml();
 String buildChannelOptions(uint8_t selected);
 String escapeJson(const String& value);
 String makeAccessPointSsid();
+void handleImplicitLenChange();
 bool applyRadioChannel(uint8_t newIndex);
 bool tuneToHomeChannel(uint8_t newIndex, bool updateSelection, float offsetKhz = 0.0f);
 bool applyRadioPower(bool highPower);
@@ -440,9 +294,9 @@ void processIncomingParityFrame(uint16_t seq,
                                 bool ackRequest,
                                 const std::vector<uint8_t>& frame);
 void processIncomingFinFrame(const std::vector<uint8_t>& frame);
-void prepareAck(uint16_t seq, uint8_t windowSize, bool forceSend);
+void prepareAckFor(PerMessageRx& ctx, uint16_t seq, uint8_t windowSize, bool forceSend);
 void sendAck(uint16_t baseSeq, uint16_t missingBitmap, bool needParity, uint8_t windowSize);
-void flushPendingData();
+void flushPendingDataFor(PerMessageRx& ctx);
 bool sendDataWindow(const std::vector<DataBlock>& blocks,
                     size_t offset,
                     uint16_t baseSeq,
@@ -454,11 +308,15 @@ void retransmitMissing(const std::vector<DataBlock>& blocks,
                        uint16_t missingBitmap);
 std::vector<DataBlock> splitPayloadIntoBlocks(const std::vector<uint8_t>& payload,
                                               bool appendCrc8);
+std::vector<uint8_t> buildTransportPayloadWithPartMarkers(const std::vector<uint8_t>& payload,
+                                                          bool appendCrc8,
+                                                          uint16_t& announcedPartCount);
 std::array<uint8_t, kFixedFrameSize> buildDataFrame(uint16_t seq,
                                                     const DataBlock& block,
                                                     bool ackRequest,
                                                     bool isParity,
                                                     uint8_t parityLengthXor = 0);
+std::array<uint8_t, kFixedFrameSize> buildStartFrame(uint8_t msgId);
 std::array<uint8_t, kFixedFrameSize> buildAckFrame(uint16_t baseSeq,
                                                    uint16_t missingBitmap,
                                                    bool needParity,
@@ -466,11 +324,12 @@ std::array<uint8_t, kFixedFrameSize> buildAckFrame(uint16_t baseSeq,
                                                    uint8_t ackType);
 std::array<uint8_t, kFixedFrameSize> buildFinFrame(uint16_t length,
                                                    uint16_t crc,
-                                                   bool harqUsed);
+                                                   bool harqUsed,
+                                                   uint8_t msgId);
 ParityPacket computeWindowParity(const std::vector<DataBlock>& blocks,
                                  size_t offset,
                                  uint8_t windowSize);
-bool attemptParityRecovery();
+bool attemptParityRecoveryFor(PerMessageRx& ctx);
 uint16_t crc16Ccitt(const uint8_t* data, size_t length, uint16_t crc = 0xFFFF);
 uint8_t crc8Dallas(const uint8_t* data, size_t length);
 void resetReceiveState();
@@ -483,6 +342,8 @@ bool setFhssEnabled(bool enable);
 void updateFhss();
 bool applyFhssHopByIndex(size_t hopIndex);
 bool advanceFhssIfDue();
+void fhssSuspend();
+void fhssResume();
 void waitInterFrameDelay();
 unsigned long computeInterFrameDelayMs();
 float estimateLoRaAirTimeMs(uint8_t payloadSize, uint16_t preambleSymbols);
@@ -491,8 +352,11 @@ void updateAckTiming(unsigned long measuredRttMs);
 void handleAckTimeoutExpansion();
 String formatByteArray(const std::vector<uint8_t>& data);
 String formatTextPayload(const std::vector<uint8_t>& data);
+uint16_t readUint16Le(const uint8_t* data);
 void configureNarrowbandRxOptions();
 void logRxTimingEvent(const String& message);
+void maybeResetStalledReception();
+void finalizeSessionWithoutFin(uint8_t msgId, PerMessageRx& pm);
 
 // --- Формирование имени Wi-Fi сети ---
 String makeAccessPointSsid() {
@@ -626,6 +490,8 @@ void setup() {
   server.on("/api/send/custom", HTTP_POST, handleSendCustom);
   server.on("/api/sf", HTTP_POST, handleSpreadingFactorChange);
   server.on("/api/fhss", HTTP_POST, handleFhssToggle);
+  server.on("/api/tcxo", HTTP_POST, handleTcxoConfig);
+  server.on("/api/implicit", HTTP_POST, handleImplicitLenChange);
   server.on("/api/protocol", HTTP_POST, handleProtocolToggle);
   server.onNotFound(handleNotFound);
   server.begin();
@@ -654,8 +520,8 @@ void processRadioEvents() {
 #endif
 
   if (processIrq) {
-    const uint32_t irqFlags = radiolib_compat::readIrqFlags(radio);   // считываем активные флаги независимо от версии API
-    radiolib_compat::clearIrqFlags(radio, RADIOLIB_SX126X_IRQ_ALL);   // сбрасываем регистр IRQ в доступном варианте
+    const uint32_t irqFlags = static_cast<uint32_t>(radio.getIrqStatus()); // современный API
+    radio.clearIrqStatus();                                               // очистка IRQ
     String irqMessage = formatSx1262IrqFlags(irqFlags);               // публикуем расшифровку событий с таймингом
     if (state.rxTiming.lastSetRxMs != 0) {
       const unsigned long delta = millis() - state.rxTiming.lastSetRxMs;
@@ -665,13 +531,15 @@ void processRadioEvents() {
   }
 
   if (!packetReceivedFlag) {
+    // Периодически проверяем зависшую сборку сообщения
+    maybeResetStalledReception();
     return;
   }
 
   packetProcessingEnabled = false;
   packetReceivedFlag = false;
 
-  std::vector<uint8_t> buffer(kImplicitPayloadLength, 0);
+  std::vector<uint8_t> buffer(state.implicitPayloadLength, 0);
   int16_t stateCode = radio.readData(buffer.data(), buffer.size());
   if (stateCode == RADIOLIB_ERR_NONE) {
     size_t actualLength = radio.getPacketLength();
@@ -679,6 +547,12 @@ void processRadioEvents() {
       actualLength = buffer.size();
     }
     buffer.resize(actualLength);
+    // Записываем метрики уровня сигнала для принятого пакета
+    float rssiDbm = radio.getRSSI();
+    float snrDb = radio.getSNR();
+    String rssiLine = String("Принят пакет: RSSI=") + String(rssiDbm, 1) +
+                      " dBm, SNR=" + String(snrDb, 1) + " dB, len=" + String(static_cast<unsigned long>(actualLength));
+    addEvent(rssiLine, String(kIncomingColor));
     processIncomingFrame(buffer);
   } else {
     logRadioError("readData", stateCode);
@@ -686,6 +560,9 @@ void processRadioEvents() {
 
   ensureReceiveMode();
   packetProcessingEnabled = true;
+
+  // После обработки пакета также проверим зависание сборки
+  maybeResetStalledReception();
 }
 
 // --- Обработчик линии DIO1 радиомодуля ---
@@ -933,6 +810,60 @@ void handleFhssToggle() {
   }
 }
 
+// --- API: конфигурация TCXO (вкл/выкл и напряжение) ---
+void handleTcxoConfig() {
+  const bool enable = server.hasArg("enable") && server.arg("enable") == "1";
+  float voltage = 0.0f;
+  if (enable) {
+    voltage = server.hasArg("v") ? server.arg("v").toFloat() : 1.8f; // типично 1.8 В
+    if (voltage < 1.6f || voltage > 3.3f) {
+      server.send(400, "application/json", "{\"error\":\"v допустим 1.6..3.3\"}");
+      return;
+    }
+  }
+
+  int16_t rc = radio.setTCXO(enable ? voltage : 0.0f);
+  if (rc != RADIOLIB_ERR_NONE) {
+    logRadioError("setTCXO", rc);
+    server.send(500, "application/json", "{\"error\":\"Не удалось применить TCXO\"}");
+    return;
+  }
+
+  addEvent(String("TCXO ") + (enable ? "включён, V=" + String(voltage, 2) + " В" : "выключен"));
+  // Обновим частоты, чтобы минимизировать фазовый сдвиг после смены TCXO
+  (void)applyRadioChannel(state.channelIndex);
+  ensureReceiveMode();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// --- API: настройка длины фиксированного LoRa-пакета (implicit header) ---
+void handleImplicitLenChange() {
+  if (!server.hasArg("len")) {
+    server.send(400, "application/json", "{\"error\":\"Не указан параметр len\"}");
+    return;
+  }
+
+  int requested = server.arg("len").toInt();
+  if (requested < 1 || requested > static_cast<int>(kFullPacketSize)) {
+    server.send(400, "application/json",
+                String("{\"error\":\"Длина должна быть в диапазоне 1-") +
+                    String(static_cast<unsigned long>(kFullPacketSize)) + "\"}");
+    return;
+  }
+
+  int16_t code = radio.implicitHeader(static_cast<uint8_t>(requested));
+  if (code != RADIOLIB_ERR_NONE) {
+    logRadioError("implicitHeader(len)", code);
+    server.send(500, "application/json", "{\"error\":\"Ошибка применения implicit header\"}");
+    return;
+  }
+
+  state.implicitPayloadLength = static_cast<size_t>(requested);
+  addEvent(String("Фиксированная длина LoRa-пакета установлена: ") + String(requested) + " байт");
+  ensureReceiveMode();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 // --- API: переключение параметров протокола ---
 void handleProtocolToggle() {
   bool handled = false;
@@ -967,6 +898,17 @@ void handleProtocolToggle() {
       server.send(500, "application/json", "{\"error\":\"Не удалось переключить FEC\"}");
       return;
     }
+    handled = true;
+  }
+
+  if (server.hasArg("sym")) {
+    bool enabled = server.arg("sym") == "1";
+    state.symmetricTxRx = enabled;
+    // Пересчитать частоты на текущем канале
+    if (!state.fhss.enabled) {
+      (void)applyRadioChannel(state.channelIndex);
+    }
+    addEvent(String("Режим TX=RX ") + (enabled ? "включён (лаборатория)" : "выключен (кросс-диапазон)"));
     handled = true;
   }
 
@@ -1074,6 +1016,11 @@ String buildIndexHtml() {
     html += " checked";
   }
   html += "> Программный FHSS</label>";
+  html += "<label><input type='checkbox' id='sym'";
+  if (state.symmetricTxRx) {
+    html += " checked";
+  }
+  html += "> Лабораторный режим: TX=RX</label>";
   html += F("<fieldset><legend>Надёжность</legend>");
   html += "<label><input type='checkbox' id='interleaving'";
   if (state.protocol.interleaving) {
@@ -1095,6 +1042,13 @@ String buildIndexHtml() {
     html += " checked";
   }
   html += "> CRC-8 на DATA (payload=4 байта)</label>";
+  // Параметр: длина фиксированного LoRa-пакета (implicit header)
+  html += "<label>Длина фиксированного пакета (implicit):</label>";
+  html += "<div style='display:flex;gap:8px;align-items:center;'>";
+  html += String("<input type='number' id='implen' min='1' max='") +
+          String(static_cast<unsigned long>(kFullPacketSize)) + "' value='" +
+          String(static_cast<unsigned long>(state.implicitPayloadLength)) + "'>";
+  html += "<button id='implenApply'>Применить</button></div>";
   html += F("</fieldset>");
   html += F("<div class='status' id='status'></div><div class='controls'>");
   html += F("<button id='sendLong'>Отправить длинный пакет 124 байта</button>");
@@ -1104,7 +1058,7 @@ String buildIndexHtml() {
   html += F("</div></section>");
 
   html += F("<section><h2>Журнал событий</h2><div id='log'></div></section></main><script>");
-  html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfSelect=document.getElementById('sf');const fhssCb=document.getElementById('fhss');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const statusEl=document.getElementById('status');let lastId=0;");
+  html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfSelect=document.getElementById('sf');const fhssCb=document.getElementById('fhss');const symCb=document.getElementById('sym');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const statusEl=document.getElementById('status');let lastId=0;");
   html += F("function appendLog(entry){const div=document.createElement('div');div.className='message';div.textContent=entry.text;if(entry.color){div.style.color=entry.color;}logEl.appendChild(div);logEl.scrollTop=logEl.scrollHeight;}");
   html += F("async function refreshLog(){try{const resp=await fetch(`/api/log?after=${lastId}`);if(!resp.ok)return;const data=await resp.json();data.events.forEach(evt=>{appendLog(evt);lastId=evt.id;});}catch(e){console.error(e);}}");
   html += F("async function postForm(url,body){const resp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(body)});if(!resp.ok){const err=await resp.json().catch(()=>({error:'Неизвестная ошибка'}));throw new Error(err.error||'Ошибка');}}");
@@ -1112,7 +1066,9 @@ String buildIndexHtml() {
   html += F("channelSel.addEventListener('change',async()=>{try{await postForm('/api/channel',{channel:channelSel.value});statusEl.textContent='Канал применён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("powerCb.addEventListener('change',async()=>{try{await postForm('/api/power',{high:powerCb.checked?'1':'0'});statusEl.textContent='Мощность обновлена';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("sfSelect.addEventListener('change',async()=>{try{await postForm('/api/sf',{sf:sfSelect.value});statusEl.textContent='Фактор расширения обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
+  html += F("document.getElementById('implenApply').addEventListener('click',async()=>{const val=document.getElementById('implen').value;try{await postForm('/api/implicit',{len:val});statusEl.textContent='Длина фиксированного пакета обновлена';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("fhssCb.addEventListener('change',async()=>{try{await postForm('/api/fhss',{enable:fhssCb.checked?'1':'0'});statusEl.textContent='Статус FHSS обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
+  html += F("symCb.addEventListener('change',async()=>{try{await postForm('/api/protocol',{sym:symCb.checked?'1':'0'});statusEl.textContent='Режим TX=RX обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("interCb.addEventListener('change',()=>{updateProtocol('interleaving',interCb.checked);});");
   html += F("harqCb.addEventListener('change',()=>{updateProtocol('harq',harqCb.checked);});");
   html += F("phyFecCb.addEventListener('change',()=>{updateProtocol('phyfec',phyFecCb.checked);});");
@@ -1172,7 +1128,10 @@ bool tuneToHomeChannel(uint8_t newIndex, bool updateSelection, float offsetKhz) 
 
   const float offsetMhz = offsetKhz / 1000.0f;                        // перевод смещения из кГц в МГц
   const float rx = frequency_tables::RX_HOME[newIndex] + offsetMhz;   // итоговая частота приёма
-  const float tx = frequency_tables::TX_HOME[newIndex] + offsetMhz;   // итоговая частота передачи
+  float tx = frequency_tables::TX_HOME[newIndex] + offsetMhz;         // итоговая частота передачи
+  if (state.symmetricTxRx) {
+    tx = rx;                                                          // лабораторный режим: одна частота для TX/RX
+  }
 
   const int16_t rxState = radio.setFrequency(rx);
   if (rxState != RADIOLIB_ERR_NONE) {
@@ -1317,7 +1276,7 @@ void updateFhss() {
 }
 
 bool advanceFhssIfDue() {
-  if (!state.fhss.enabled) {
+  if (!state.fhss.enabled || state.fhss.suspendDepth > 0) {
     return false;
   }
 
@@ -1359,21 +1318,19 @@ void configureNarrowbandRxOptions() {
       (bandwidthHz > 0.0f) ? (static_cast<float>(1UL << sf) / bandwidthHz) * 1000.0f : 0.0f;
   const bool narrowBandwidth = (bandwidthKhz <= 10.0f);
   const bool veryNarrowBandwidth = (bandwidthKhz <= 8.0f);
-  constexpr bool kStopRxTimerSupported =
-      radiolib_features::HasSetStopRxTimerOnPreamble<SX1262>::value;
-  constexpr bool kDirectLdroControlSupported =
-      radiolib_features::HasSetLowDataRateOptimization<SX1262>::value ||
-      radiolib_features::HasForceLdro<SX1262>::value;
-  constexpr bool kRxTimeoutSymbolsSupported =
-      radiolib_features::HasSetRxTimeoutSymbols<SX1262>::value;
-  constexpr bool kLoRaSymbTimeoutSupported =
-      radiolib_features::HasSetLoRaSymbNumTimeout<SX1262>::value;
+  // Поддерживаем только современный API RadioLib
 
+  // Масштабируем минимальную преамбулу от SF (а не только от BW):
+  // SF5-6 → ≥12, SF7 → ≥16, SF8-9 → ≥24, SF10-12 → ≥32
   uint16_t targetPreamble = state.rxTiming.preambleSymbols;
-  if (veryNarrowBandwidth) {
+  if (sf >= 11) {
+    targetPreamble = std::max<uint16_t>(targetPreamble, static_cast<uint16_t>(32));
+  } else if (sf >= 9) {
     targetPreamble = std::max<uint16_t>(targetPreamble, static_cast<uint16_t>(24));
-  } else if (narrowBandwidth) {
+  } else if (sf >= 7) {
     targetPreamble = std::max<uint16_t>(targetPreamble, static_cast<uint16_t>(16));
+  } else {
+    targetPreamble = std::max<uint16_t>(targetPreamble, static_cast<uint16_t>(12));
   }
 
   if (targetPreamble != state.rxTiming.preambleSymbols) {
@@ -1389,47 +1346,25 @@ void configureNarrowbandRxOptions() {
 
   const bool desiredStop = narrowBandwidth;
   if (desiredStop != state.rxTiming.stopTimerOnPreamble) {
-    const int16_t code =
-        radiolib_compat::setStopRxTimerOnPreambleIfSupported(radio, desiredStop);
+    const int16_t code = radio.setStopRxTimerOnPreamble(desiredStop);
     if (code == RADIOLIB_ERR_NONE) {
       state.rxTiming.stopTimerOnPreamble = desiredStop;
       logRxTimingEvent(String("StopRxTimerOnPreamble ") + (desiredStop ? "включён" : "выключен"));
-    } else if (code == RADIOLIB_ERR_UNSUPPORTED) {
-      if (narrowBandwidth && !state.rxTiming.reportedMissingStopTimerSupport) {
-        state.rxTiming.reportedMissingStopTimerSupport = true;
-        logRxTimingEvent(
-            F("RadioLib не поддерживает StopRxTimerOnPreamble — следим за таймерами вручную"));
-      }
     } else {
       logRadioError("setStopRxTimerOnPreamble", code);
     }
-  } else if (!kStopRxTimerSupported && narrowBandwidth &&
-             !state.rxTiming.reportedMissingStopTimerSupport) {
-    state.rxTiming.reportedMissingStopTimerSupport = true;
-    logRxTimingEvent(
-        F("RadioLib не поддерживает StopRxTimerOnPreamble — следим за таймерами вручную"));
   }
 
   const bool needLdro = (symbolDurationMs >= 16.0f);
   if (needLdro != state.rxTiming.ldroForced) {
-    const int16_t code = radiolib_compat::setLowDataRateOptimizationIfSupported(radio, needLdro);
+    const int16_t code = radio.setLowDataRateOptimization(needLdro);
     if (code == RADIOLIB_ERR_NONE) {
       state.rxTiming.ldroForced = needLdro;
       logRxTimingEvent(String("LDRO ") + (needLdro ? "включён" : "выключен") +
                        String(" (Ts=") + String(symbolDurationMs, 2) + " мс)");
-    } else if (code == RADIOLIB_ERR_UNSUPPORTED) {
-      if (needLdro && !state.rxTiming.reportedMissingLdroSupport) {
-        state.rxTiming.reportedMissingLdroSupport = true;
-        logRxTimingEvent(
-            F("Нет API принудительного LDRO — убедитесь, что RadioLib активирует его сам"));
-      }
     } else {
       logRadioError("setLowDataRateOptimization", code);
     }
-  } else if (!kDirectLdroControlSupported && needLdro &&
-             !state.rxTiming.reportedMissingLdroSupport) {
-    state.rxTiming.reportedMissingLdroSupport = true;
-    logRxTimingEvent(F("Нет API принудительного LDRO — убедитесь, что RadioLib активирует его сам"));
   }
 
   const bool needExtendedTimeout = narrowBandwidth || (symbolDurationMs >= 10.0f);
@@ -1449,7 +1384,7 @@ void configureNarrowbandRxOptions() {
   const bool symbolsChangeNeeded =
       (appliedSymbols != state.rxTiming.rxTimeoutSymbols) || (state.rxTiming.rxContinuous != useContinuous);
   if (symbolsChangeNeeded) {
-    const int16_t code = radiolib_compat::setRxTimeoutSymbolsIfSupported(radio, appliedSymbols);
+    const int16_t code = radio.setRxTimeout(timeoutSeconds);
     if (code == RADIOLIB_ERR_NONE) {
       state.rxTiming.rxTimeoutSymbols = appliedSymbols;
       state.rxTiming.rxContinuous = useContinuous;
@@ -1459,64 +1394,43 @@ void configureNarrowbandRxOptions() {
         logRxTimingEvent(String("RX тайм-аут ≈ ") + String(timeoutSeconds, 2) + " с");
       }
       timeoutConfigured = true;
-    } else if (code == RADIOLIB_ERR_UNSUPPORTED) {
-      // попробуем fallback на секунды
     } else {
       logRadioError("setRxTimeout", code);
       timeoutConfigured = true;
     }
-  } else if (kRxTimeoutSymbolsSupported) {
-    // Значение уже применено и поддерживается — считаем, что настройка актуальна.
+  } else {
     timeoutConfigured = true;
   }
 
-  if (!timeoutConfigured) {
-    const bool shouldApplySeconds = useContinuous || needExtendedTimeout;
-    if (shouldApplySeconds) {
-      const int16_t code = radiolib_compat::setRxTimeoutSecondsIfSupported(radio, timeoutSeconds);
-      if (code == RADIOLIB_ERR_NONE) {
-        state.rxTiming.rxTimeoutSymbols = appliedSymbols;
-        state.rxTiming.rxContinuous = useContinuous;
-        if (useContinuous) {
-          logRxTimingEvent(F("RX переведён в непрерывный режим (SetRx timeout=0)"));
-        } else {
-          logRxTimingEvent(String("RX тайм-аут ≈ ") + String(timeoutSeconds, 2) + " с");
-        }
-        timeoutConfigured = true;
-      } else if (code == RADIOLIB_ERR_UNSUPPORTED) {
-        // оставим сообщение чуть ниже
-      } else {
-        logRadioError("setRxTimeout", code);
-        timeoutConfigured = true;
-      }
-    }
-  }
-
-  if (!timeoutConfigured && needExtendedTimeout && !state.rxTiming.reportedMissingRxTimeoutSupport) {
-    state.rxTiming.reportedMissingRxTimeoutSupport = true;
-    logRxTimingEvent(F("RadioLib не даёт выставить RX тайм-аут — окно нужно держать вручную"));
-  }
-
+  // Таймаут поиска заголовка масштабируем от SF: для SF≥8 даём больший запас символов
+  const uint8_t headerReserve = (sf >= 8) ? 16U : 8U;
   const uint16_t desiredSymbTimeout = static_cast<uint16_t>(
-      std::min<uint32_t>(255U, static_cast<uint32_t>(targetPreamble + 8U)));
+      std::min<uint32_t>(255U, static_cast<uint32_t>(targetPreamble + headerReserve)));
   if (desiredSymbTimeout != 0 && desiredSymbTimeout != state.rxTiming.symbTimeout) {
-    const int16_t code = radiolib_compat::setLoRaSymbNumTimeoutIfSupported(
-        radio, static_cast<uint8_t>(desiredSymbTimeout));
+    const int16_t code = radio.setLoRaSymbNumTimeout(static_cast<uint8_t>(desiredSymbTimeout));
     if (code == RADIOLIB_ERR_NONE) {
       state.rxTiming.symbTimeout = desiredSymbTimeout;
       logRxTimingEvent(String("LoRaSymbNumTimeout установлен в ") + String(desiredSymbTimeout) + " символов");
-    } else if (code == RADIOLIB_ERR_UNSUPPORTED) {
-      if (narrowBandwidth && !state.rxTiming.reportedMissingSymbTimeoutSupport) {
-        state.rxTiming.reportedMissingSymbTimeoutSupport = true;
-        logRxTimingEvent(F("Нет доступа к LoRaSymbNumTimeout — оставляем поиск заголовка по умолчанию"));
-      }
     } else {
       logRadioError("setLoRaSymbNumTimeout", code);
     }
-  } else if (!kLoRaSymbTimeoutSupported && narrowBandwidth &&
-             !state.rxTiming.reportedMissingSymbTimeoutSupport) {
-    state.rxTiming.reportedMissingSymbTimeoutSupport = true;
-    logRxTimingEvent(F("Нет доступа к LoRaSymbNumTimeout — оставляем поиск заголовка по умолчанию"));
+  }
+}
+
+// --- Настройка мощности передачи ---
+// --- Вспомогательные функции для временной заморозки FHSS ---
+void fhssSuspend() {
+  if (state.fhss.suspendDepth < 0xFF) {
+    ++state.fhss.suspendDepth;
+  }
+}
+
+void fhssResume() {
+  if (state.fhss.suspendDepth > 0) {
+    --state.fhss.suspendDepth;
+  }
+  if (state.fhss.suspendDepth == 0) {
+    state.fhss.lastHopMillis = millis(); // сброс таймера, чтобы не прыгнуть сразу после резюма
   }
 }
 
@@ -1572,13 +1486,11 @@ bool ensureReceiveMode() {
   state.rxTiming.lastSetRxMs = now;
 
   bool shouldLog = true;
-  if (state.fhss.enabled && state.fhss.hopCount > 1U) {
-    constexpr unsigned long kFhssSetRxLogIntervalMs = 1000; // минимальная пауза между логами при активном FHSS
-    if (state.rxTiming.lastSetRxLogMs != 0U) {
-      const unsigned long delta = now - state.rxTiming.lastSetRxLogMs;
-      if (delta < kFhssSetRxLogIntervalMs) {
-        shouldLog = false;
-      }
+  const unsigned long kSetRxLogIntervalMs = (state.fhss.enabled && state.fhss.hopCount > 1U) ? 1000UL : 20UL;
+  if (state.rxTiming.lastSetRxLogMs != 0U) {
+    const unsigned long delta = now - state.rxTiming.lastSetRxLogMs;
+    if (delta < kSetRxLogIntervalMs) {
+      shouldLog = false;
     }
   }
 
@@ -1609,18 +1521,40 @@ bool sendPayload(const std::vector<uint8_t>& payload, const String& context) {
     return false;
   }
 
+  // На время передачи всего сообщения замораживаем FHSS, чтобы частота не менялась
+  struct FhssScope { FhssScope(){ fhssSuspend(); } ~FhssScope(){ fhssResume(); } } fhssGuard;
+
   addEvent(context + ": " + formatByteArray(payload) + " | \"" + formatTextPayload(payload) + "\"");
 
   const uint16_t crc = crc16Ccitt(payload.data(), payload.size());
-  auto blocks = splitPayloadIntoBlocks(payload, state.protocol.payloadCrc8);
+  uint16_t announcedParts = 0;
+  auto transportPayload = buildTransportPayloadWithPartMarkers(payload,
+                                                               state.protocol.payloadCrc8,
+                                                               announcedParts);
+  addEvent(String("Полезная нагрузка разбита на ") +
+           String(static_cast<unsigned long>(announcedParts)) + " частей");
+  auto blocks = splitPayloadIntoBlocks(transportPayload, state.protocol.payloadCrc8);
   if (blocks.empty()) {
     addEvent("Не удалось подготовить DATA-пакеты для передачи");
     return false;
   }
 
+  // Назначаем идентификатор сообщения заранее
+  const uint8_t msgId = static_cast<uint8_t>(state.nextMessageId++ & 0x0F);
+
+  // Перед началом окна отправим уникальный START-кадр (для данного msgId),
+  // чтобы приёмник сбросил состояние сборки именно для этого сообщения
+  {
+    auto startFrame = buildStartFrame(msgId);
+    if (!transmitFrame(startFrame, F("START"))) {
+      return false;
+    }
+    waitInterFrameDelay();
+  }
+
   size_t totalBlocks = blocks.size();
   size_t offset = 0;
-  uint16_t windowBaseSeq = state.nextTxSequence;
+  uint16_t windowBaseSeq = composeSeq(msgId, 0);
   bool harqUsed = false;
 
   while (offset < totalBlocks) {
@@ -1685,9 +1619,9 @@ bool sendPayload(const std::vector<uint8_t>& payload, const String& context) {
     windowBaseSeq = static_cast<uint16_t>(windowBaseSeq + windowSize);
   }
 
-  state.nextTxSequence = static_cast<uint16_t>(state.nextTxSequence + totalBlocks);
+  state.nextTxSequence = 0;
 
-  auto finFrame = buildFinFrame(static_cast<uint16_t>(payload.size()), crc, harqUsed);
+  auto finFrame = buildFinFrame(static_cast<uint16_t>(payload.size()), crc, harqUsed, msgId);
   if (!transmitFrame(finFrame, F("FIN"))) {
     return false;
   }
@@ -1775,9 +1709,9 @@ bool waitForAck(uint16_t baseSeq, uint8_t windowSize, uint16_t& missingBitmap, b
       return true;
     }
 #if defined(ARDUINO)
-    delay(5);
+    delay(3);
 #else
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
 #endif
   }
   handleAckTimeoutExpansion();
@@ -1789,6 +1723,7 @@ void retransmitMissing(const std::vector<DataBlock>& blocks,
                        size_t offset,
                        uint16_t baseSeq,
                        uint16_t missingBitmap) {
+  int8_t lastBitNeedingAck = -1;
   for (uint8_t bit = 0; bit < kBitmapWidth; ++bit) {
     if ((missingBitmap & (1U << bit)) == 0U) {
       continue;
@@ -1797,8 +1732,22 @@ void retransmitMissing(const std::vector<DataBlock>& blocks,
     if (blockIndex >= blocks.size()) {
       continue;
     }
-    auto frame = buildDataFrame(static_cast<uint16_t>(baseSeq + bit), blocks[blockIndex], (bit == 0), false);
-    transmitFrame(frame, F("DATA retry"));
+    lastBitNeedingAck = static_cast<int8_t>(bit);
+  }
+
+  for (uint8_t bit = 0; bit < kBitmapWidth; ++bit) {
+    if ((missingBitmap & (1U << bit)) == 0U) {
+      continue;
+    }
+    const size_t blockIndex = offset + bit;
+    if (blockIndex >= blocks.size()) {
+      continue;
+    }
+    const bool ackRequest = (lastBitNeedingAck >= 0)
+                                ? (bit == static_cast<uint8_t>(lastBitNeedingAck))
+                                : (bit == 0);
+    auto frame = buildDataFrame(static_cast<uint16_t>(baseSeq + bit), blocks[blockIndex], ackRequest, false);
+    transmitFrame(frame, ackRequest ? F("DATA retry (ACK)") : F("DATA retry"));
     waitInterFrameDelay();
   }
 }
@@ -1811,25 +1760,32 @@ bool transmitFrame(const std::array<uint8_t, kFixedFrameSize>& frame, const Stri
   if (state.fhss.enabled) {
     advanceFhssIfDue();
   }
-
-  int16_t freqState = radio.setFrequency(state.currentTxFreq);
-  if (freqState != RADIOLIB_ERR_NONE) {
-    logRadioError("setFrequency(TX)", freqState);
-    return false;
+  // Если TX и RX частоты совпадают, не перенастраиваем PLL каждый раз
+  const bool sameTxRx = (std::fabs(state.currentTxFreq - state.currentRxFreq) < 0.0001f);
+  if (!sameTxRx) {
+    int16_t freqState = radio.setFrequency(state.currentTxFreq);
+    if (freqState != RADIOLIB_ERR_NONE) {
+      logRadioError("setFrequency(TX)", freqState);
+      return false;
+    }
   }
 
   int16_t result = radio.transmit(const_cast<uint8_t*>(frame.data()), kFixedFrameSize);
   if (result != RADIOLIB_ERR_NONE) {
     logRadioError("transmit", result);
-    radio.setFrequency(state.currentRxFreq);
+    if (!sameTxRx) {
+      (void)radio.setFrequency(state.currentRxFreq);
+    }
     ensureReceiveMode();
     return false;
   }
 
-  int16_t backState = radio.setFrequency(state.currentRxFreq);
-  if (backState != RADIOLIB_ERR_NONE) {
-    logRadioError("setFrequency(RX restore)", backState);
-    return false;
+  if (!sameTxRx) {
+    int16_t backState = radio.setFrequency(state.currentRxFreq);
+    if (backState != RADIOLIB_ERR_NONE) {
+      logRadioError("setFrequency(RX restore)", backState);
+      return false;
+    }
   }
 
   return ensureReceiveMode();
@@ -1886,14 +1842,24 @@ std::array<uint8_t, kFixedFrameSize> buildAckFrame(uint16_t baseSeq,
 // --- Построение FIN-кадра ---
 std::array<uint8_t, kFixedFrameSize> buildFinFrame(uint16_t length,
                                                    uint16_t crc,
-                                                   bool harqUsed) {
+                                                   bool harqUsed,
+                                                   uint8_t msgId) {
   std::array<uint8_t, kFixedFrameSize> frame{};
   frame[0] = static_cast<uint8_t>(kFrameTypeFin | (harqUsed ? kFinFlagHarqUsed : 0));
   frame[1] = static_cast<uint8_t>(length & 0xFFU);
   frame[2] = static_cast<uint8_t>((length >> 8) & 0xFFU);
   frame[3] = static_cast<uint8_t>(crc & 0xFFU);
   frame[4] = static_cast<uint8_t>((crc >> 8) & 0xFFU);
+  frame[5] = static_cast<uint8_t>(msgId & 0x0F);  // в FIN передаём идентификатор сообщения
   return frame;
+}
+
+// --- Построение управляющего START-кадра ---
+std::array<uint8_t, kFixedFrameSize> buildStartFrame(uint8_t msgId) {
+  DataBlock block;
+  block.bytes = kStartMagic;
+  block.dataLength = kFramePayloadSize;
+  return buildDataFrame(composeSeq(msgId, 0), block, false, false, 0);
 }
 
 // --- Расчёт паритета по окну DATA-блоков ---
@@ -1917,6 +1883,34 @@ ParityPacket computeWindowParity(const std::vector<DataBlock>& blocks,
   return parity;
 }
 
+// --- Формирование транспортного буфера с метаданными количества частей ---
+std::vector<uint8_t> buildTransportPayloadWithPartMarkers(const std::vector<uint8_t>& payload,
+                                                          bool appendCrc8,
+                                                          uint16_t& announcedPartCount) {
+  std::vector<uint8_t> transport;
+  transport.reserve(payload.size() + kPartCountMetadataBytes);
+  transport.resize(kPartCountFieldSize, 0);
+  transport.insert(transport.end(), payload.begin(), payload.end());
+  transport.resize(transport.size() + kPartCountFieldSize, 0);
+
+  const size_t dataBytesPerBlock = appendCrc8 ? (kFramePayloadSize - 1U) : kFramePayloadSize;
+  if (dataBytesPerBlock == 0) {
+    announcedPartCount = 0;
+    return transport;
+  }
+
+  announcedPartCount = static_cast<uint16_t>(
+      (transport.size() + dataBytesPerBlock - 1U) / dataBytesPerBlock);
+
+  for (size_t i = 0; i < kPartCountFieldSize; ++i) {
+    const uint8_t byteValue = static_cast<uint8_t>((announcedPartCount >> (8U * i)) & 0xFFU);
+    transport[i] = byteValue;
+    transport[transport.size() - kPartCountFieldSize + i] = byteValue;
+  }
+
+  return transport;
+}
+
 // --- Разбиение сообщения на DATA-блоки ---
 std::vector<DataBlock> splitPayloadIntoBlocks(const std::vector<uint8_t>& payload,
                                               bool appendCrc8) {
@@ -1925,11 +1919,19 @@ std::vector<DataBlock> splitPayloadIntoBlocks(const std::vector<uint8_t>& payloa
   size_t offset = 0;
   while (offset < payload.size()) {
     DataBlock block;
+    block.bytes.fill(0);
     const size_t chunk = std::min(dataBytesPerBlock, payload.size() - offset);
-    std::copy_n(payload.begin() + offset, chunk, block.bytes.begin());
+    if (chunk > 0) {
+      std::copy_n(payload.begin() + offset, chunk, block.bytes.begin());
+    }
     block.dataLength = static_cast<uint8_t>(chunk);
     if (appendCrc8) {
-      block.bytes[dataBytesPerBlock] = crc8Dallas(block.bytes.data(), chunk);
+      const size_t crcIndex = chunk;
+      if (crcIndex >= block.bytes.size()) {
+        addEvent("Ошибка подготовки DATA-пакета: недостаточно места под CRC-8");
+        return {};
+      }
+      block.bytes[crcIndex] = crc8Dallas(block.bytes.data(), chunk);
     }
     blocks.push_back(block);
     offset += chunk;
@@ -1986,12 +1988,29 @@ unsigned long computeInterFrameDelayMs() {
     return kInterFrameDelayMs;
   }
 
-  const unsigned long guard = static_cast<unsigned long>(std::ceil(airtime * 0.2f));
-  unsigned long delayMs = std::max<unsigned long>(guard, 5UL);
+  const bool highSf = (state.currentSpreadingFactor >= 8);
+  const unsigned long minDelay = highSf ? 8UL : 3UL;
+  const unsigned long maxDelay = highSf ? 16UL : kInterFrameDelayMs;
+  const unsigned long guard = static_cast<unsigned long>(std::ceil(airtime * 0.12f));
+  unsigned long delayMs = std::max<unsigned long>(guard, minDelay);
   if (state.rxWindow.lastAckRttMs > 0) {
     delayMs = std::max<unsigned long>(delayMs, state.rxWindow.lastAckRttMs / 12U + 1U);
   }
-  return std::clamp<unsigned long>(delayMs, 5U, kInterFrameDelayMs);
+  return std::clamp<unsigned long>(delayMs, minDelay, maxDelay);
+}
+
+// --- Небольшая пауза перед отправкой ACK, чтобы удалённая сторона успела переключиться в RX ---
+unsigned long computeAckTurnaroundDelayMs() {
+  const float air = estimateLoRaAirTimeMs(static_cast<uint8_t>(kFixedFrameSize),
+                                          state.rxTiming.preambleSymbols);
+  if (!std::isfinite(air) || air <= 0.0f) {
+    return 4UL;
+  }
+  const unsigned long guard = static_cast<unsigned long>(std::ceil(air * 0.12f));
+  const bool highSf = (state.currentSpreadingFactor >= 8);
+  const unsigned long minSifs = highSf ? 12UL : 6UL;
+  const unsigned long maxSifs = highSf ? 20UL : 12UL;
+  return std::clamp<unsigned long>(std::max<unsigned long>(guard, minSifs), minSifs, maxSifs);
 }
 
 // --- Оценка времени передачи кадра LoRa ---
@@ -2027,10 +2046,10 @@ float estimateLoRaAirTimeMs(uint8_t payloadSize, uint16_t preambleSymbols) {
 unsigned long computeAckTimeoutMs(uint8_t windowSize) {
   const float ackAirTime = estimateLoRaAirTimeMs(static_cast<uint8_t>(kFixedFrameSize),
                                                  state.rxTiming.preambleSymbols);
-  const unsigned long airGuard = static_cast<unsigned long>(std::ceil(ackAirTime)) + 40U;
-  const unsigned long windowGuard = static_cast<unsigned long>(windowSize) * 12U;
+  const unsigned long airGuard = static_cast<unsigned long>(std::ceil(ackAirTime)) + 35U;
+  const unsigned long windowGuard = static_cast<unsigned long>(windowSize) * (kInterFrameDelayMs);
   const unsigned long adaptive = state.rxWindow.adaptiveAckTimeoutMs;
-  return std::max<unsigned long>({150UL, airGuard + windowGuard, adaptive});
+  return std::max<unsigned long>({140UL, airGuard + windowGuard, adaptive});
 }
 
 // --- Обновление статистики ожидания ACK ---
@@ -2039,12 +2058,12 @@ void updateAckTiming(unsigned long measuredRttMs) {
   const float ackAirTime = estimateLoRaAirTimeMs(static_cast<uint8_t>(kFixedFrameSize),
                                                  state.rxTiming.preambleSymbols);
   const unsigned long target = std::max<unsigned long>(
-      static_cast<unsigned long>(std::ceil(ackAirTime)) + 40U,
-      measuredRttMs + 20U);
+      static_cast<unsigned long>(std::ceil(ackAirTime)) + 30U,
+      measuredRttMs + 15U);
   constexpr float kAlpha = 0.3f;
   const float updated = static_cast<float>(state.rxWindow.adaptiveAckTimeoutMs) * (1.0f - kAlpha) +
                         static_cast<float>(target) * kAlpha;
-  state.rxWindow.adaptiveAckTimeoutMs = static_cast<unsigned long>(std::clamp(updated, 150.0f, 2000.0f));
+  state.rxWindow.adaptiveAckTimeoutMs = static_cast<unsigned long>(std::clamp(updated, 140.0f, 1800.0f));
 }
 
 // --- Реакция на истечение тайм-аута ACK ---
@@ -2091,6 +2110,15 @@ String formatByteArray(const std::vector<uint8_t>& data) {
   return out;
 }
 
+// --- Чтение uint16 в формате little-endian ---
+uint16_t readUint16Le(const uint8_t* data) {
+  if (!data) {
+    return 0;
+  }
+  return static_cast<uint16_t>(data[0]) |
+         static_cast<uint16_t>(data[1]) << 8;
+}
+
 // --- Формирование строки статуса оконных пакетов вида |✅|⛔️| ---
 String formatWindowReceptionStatus(uint16_t receivedMask, uint8_t windowSize) {
   if (windowSize == 0) {
@@ -2116,9 +2144,66 @@ void logReceivedMessage(const std::vector<uint8_t>& payload) {
 
 // --- Полный сброс состояния приёмника ---
 void resetReceiveState() {
-  state.rxWindow = {};
-  state.rxMessage = {};
+  state.rxWindow = {}; // сохраняем тайминги ACK для TX
+  // Очистить все параллельные сессии RX
+  state.rxSessions.clear();
   state.pendingAck = {};
+}
+
+// --- Сторож: принудительный сброс зависшей сборки сообщения ---
+void maybeResetStalledReception() {
+  if (state.rxSessions.empty()) {
+    return;
+  }
+  const unsigned long now = millis();
+  const unsigned long threshold = std::max<unsigned long>(3000UL, state.rxWindow.adaptiveAckTimeoutMs * 3UL + 200UL);
+  std::vector<uint8_t> toErase;
+  for (const auto& kv : state.rxSessions) {
+    const uint8_t msgId = kv.first;
+    const PerMessageRx& pm = kv.second;
+    // Не сбрасываем сессию, если есть «активность» (дубликаты окон/кадров),
+    // даже если нет прогресса — ждём возможный FIN. Берём более свежую из activity/progress.
+    const unsigned long last = std::max(pm.msg.lastProgressMs, pm.msg.lastActivityMs);
+    if (last != 0 && now - last > threshold) {
+      // Перед сбросом попробуем завершить сообщение без FIN, если данные выглядят полными
+      finalizeSessionWithoutFin(msgId, state.rxSessions[msgId]);
+      toErase.push_back(msgId);
+    }
+  }
+  for (uint8_t id : toErase) {
+    state.rxSessions.erase(id);
+  }
+}
+
+// --- Попытка завершить сборку без FIN при тайм-ауте ---
+void finalizeSessionWithoutFin(uint8_t msgId, PerMessageRx& pm) {
+  if (!pm.msg.active) {
+    return;
+  }
+  // Нужен хотя бы префикс с количеством частей
+  if (pm.msg.buffer.size() < kPartCountFieldSize) {
+    addEvent(String("Сброс сборки msgId=") + String(msgId) + ": нет FIN и недостаточно данных для вывода");
+    return;
+  }
+  // Попробуем выделить полезную нагрузку между префиксом и (возможным) суффиксом
+  const uint16_t prefixCount = readUint16Le(pm.msg.buffer.data());
+  size_t payloadStart = kPartCountFieldSize;
+  size_t payloadEnd = pm.msg.buffer.size();
+  if (pm.msg.buffer.size() >= kPartCountFieldSize * 2) {
+    const uint16_t tail = readUint16Le(pm.msg.buffer.data() + (pm.msg.buffer.size() - kPartCountFieldSize));
+    if (tail == prefixCount) {
+      payloadEnd -= kPartCountFieldSize; // убираем суффикс
+    }
+  }
+  if (payloadEnd <= payloadStart) {
+    addEvent(String("Сброс сборки msgId=") + String(msgId) + ": нет FIN, полезной нагрузки нет");
+    return;
+  }
+  std::vector<uint8_t> payload;
+  payload.assign(pm.msg.buffer.begin() + payloadStart, pm.msg.buffer.begin() + payloadEnd);
+  addEvent(String("Принято сообщение без FIN (тайм-аут), msgId=") + String(msgId) +
+           String(", байт=") + String(static_cast<unsigned long>(payload.size())));
+  logReceivedMessage(payload);
 }
 
 // --- Обработка принятого кадра ---
@@ -2173,15 +2258,45 @@ void processIncomingDataFrame(const std::vector<uint8_t>& frame) {
   const bool ackRequest = (flags & kDataFlagAckRequest) != 0;
   const bool isParity = (flags & kDataFlagIsParity) != 0;
 
-  if (!state.rxWindow.active || seq < state.rxWindow.baseSeq ||
-      seq >= static_cast<uint16_t>(state.rxWindow.baseSeq + kBitmapWidth)) {
-    state.rxWindow.active = true;
-    state.rxWindow.baseSeq = static_cast<uint16_t>(seq - (seq % kArqWindowSize));
-    state.rxWindow.receivedMask = 0;
-    state.rxWindow.windowSize = 0;
-    state.rxWindow.parityValid = false;
-    state.rxWindow.parityBlock = {};
-    state.rxWindow.parityLengthXor = 0;
+  // Обнаружение управляющего START-кадра: DATA без флагов, длина = kFramePayloadSize и магическая полезная нагрузка
+  if (!isParity && !ackRequest && lengthField == kFramePayloadSize && frame.size() >= 3 + kFramePayloadSize) {
+    bool isStart = true;
+    for (size_t i = 0; i < kFramePayloadSize; ++i) {
+      if (frame[3 + i] != kStartMagic[i]) {
+        isStart = false;
+        break;
+      }
+    }
+    if (isStart) {
+      const uint8_t startMsgId = extractMsgId(seq);
+      addEvent(String("Получен START для msgId=") + String(startMsgId) + F(" — очищаем буфер этого сообщения"));
+      // Сброс только для данного msgId
+      auto it = state.rxSessions.find(startMsgId);
+      if (it != state.rxSessions.end()) {
+        state.rxSessions.erase(it);
+      }
+      return;
+    }
+  }
+
+  const uint8_t msgId = extractMsgId(seq);
+  const uint16_t part = extractPart(seq);
+  PerMessageRx& pm = state.rxSessions[msgId];
+  if (!pm.win.active ||
+      part < extractPart(pm.win.baseSeq) ||
+      part >= static_cast<uint16_t>(extractPart(pm.win.baseSeq) + kBitmapWidth)) {
+    pm.win.active = true;
+    const uint16_t basePart = static_cast<uint16_t>(part - (part % kArqWindowSize));
+    pm.win.baseSeq = composeSeq(msgId, basePart);
+    pm.win.receivedMask = 0;
+    pm.win.windowSize = 0;
+    pm.win.parityValid = false;
+    pm.win.parityBlock = {};
+    pm.win.parityLengthXor = 0;
+    if (!pm.msg.active) {
+      pm.msg.lastActivityMs = millis();
+      pm.msg.lastProgressMs = pm.msg.lastActivityMs;
+    }
   }
 
   if (isParity) {
@@ -2189,55 +2304,68 @@ void processIncomingDataFrame(const std::vector<uint8_t>& frame) {
     return;
   }
 
-  const uint8_t bit = static_cast<uint8_t>(seq - state.rxWindow.baseSeq);
+  const uint8_t bit = static_cast<uint8_t>(extractPart(seq) - extractPart(pm.win.baseSeq));
   if (bit < kBitmapWidth) {
-    state.rxWindow.receivedMask |= static_cast<uint16_t>(1U << bit);
-    state.rxWindow.windowSize = static_cast<uint8_t>(std::max<uint8_t>(state.rxWindow.windowSize, bit + 1));
+    pm.win.receivedMask |= static_cast<uint16_t>(1U << bit);
+    pm.win.windowSize = static_cast<uint8_t>(std::max<uint8_t>(pm.win.windowSize, bit + 1));
   }
 
-  if (!state.rxMessage.active) {
-    state.rxMessage.active = true;
-    state.rxMessage.nextExpectedSeq = seq;
-    state.rxMessage.buffer.clear();
-    state.rxMessage.pending.clear();
-    state.rxMessage.declaredLength = 0;
-    state.rxMessage.declaredCrc = 0;
-    state.rxMessage.finReceived = false;
+  if (!pm.msg.active) {
+    pm.msg.active = true;
+    pm.msg.nextExpectedSeq = seq;
+    pm.msg.buffer.clear();
+    pm.msg.pending.clear();
+    pm.msg.declaredLength = 0;
+    pm.msg.declaredCrc = 0;
+    pm.msg.finReceived = false;
+    pm.msg.partCountFromPrefix = false;
+    pm.msg.partCountFromSuffix = false;
+    pm.msg.announcedPartCount = 0;
+    pm.msg.lastActivityMs = millis();
+    pm.msg.lastProgressMs = pm.msg.lastActivityMs;
   }
 
   DataBlock block;
+  block.bytes.fill(0);
   const size_t payloadAvailable = std::min<size_t>(kFramePayloadSize, frame.size() - 3);
-  std::copy_n(frame.begin() + 3, payloadAvailable, block.bytes.begin());
-  block.dataLength = std::min<uint8_t>(lengthField, kFramePayloadSize);
+  const uint8_t declaredLength = std::min<uint8_t>(lengthField, static_cast<uint8_t>(kFramePayloadSize));
+  if (declaredLength > payloadAvailable) {
+    addEvent("DATA-кадр повреждён: объявленная длина превышает полезную нагрузку");
+    return;
+  }
+  if (declaredLength > 0) {
+    std::copy_n(frame.begin() + 3, declaredLength, block.bytes.begin());
+  }
+  block.dataLength = declaredLength;
 
-  if (state.protocol.payloadCrc8 && block.dataLength > 0) {
+  if (state.protocol.payloadCrc8) {
     if (block.dataLength == 0) {
       addEvent("DATA-кадр содержит некорректную длину");
       return;
     }
-    if (block.dataLength > 0) {
-      const uint8_t crcOffset = block.dataLength - 1;
-      const uint8_t expected = block.bytes[crcOffset];
-      const uint8_t actualLength = crcOffset;
-      const uint8_t computed = crc8Dallas(block.bytes.data(), actualLength);
-      if (computed != expected) {
-        addEvent("CRC-8 DATA не сошёлся, кадр отброшен");
-        return;
-      }
-      block.dataLength = actualLength;
+    const uint8_t crcOffset = static_cast<uint8_t>(block.dataLength - 1U);
+    const uint8_t expected = block.bytes[crcOffset];
+    const uint8_t actualLength = crcOffset;
+    const uint8_t computed = crc8Dallas(block.bytes.data(), actualLength);
+    if (computed != expected) {
+      addEvent("CRC-8 DATA не сошёлся, кадр отброшен");
+      return;
     }
+    block.bytes[crcOffset] = 0;
+    block.dataLength = actualLength;
   }
 
-  state.rxMessage.pending[seq] = block;
-  flushPendingData();
+  pm.msg.pending[seq] = block;
+  pm.msg.lastActivityMs = millis();
+  flushPendingDataFor(pm);
 
-  if (state.rxWindow.parityValid && attemptParityRecovery()) {
+  if (pm.win.parityValid && attemptParityRecoveryFor(pm)) {
     addEvent("Потерянный DATA-блок восстановлен по паритету");
   }
 
   if (ackRequest) {
-    const uint8_t windowCount = static_cast<uint8_t>(std::max<uint8_t>(state.rxWindow.windowSize, bit + 1));
-    prepareAck(seq, windowCount, true);
+    const uint8_t windowCount = static_cast<uint8_t>(std::max<uint8_t>(pm.win.windowSize, bit + 1));
+    prepareAckFor(pm, seq, windowCount, true);
   }
 }
 
@@ -2258,7 +2386,8 @@ void processIncomingAckFrame(const std::vector<uint8_t>& frame) {
   String log = String("Принят ACK: base=") + String(note.baseSeq) +
                ", missing=0x" + String(note.missingBitmap, 16) +
                ", window=" + String(note.reportedWindow) +
-               ", тип=" + String(note.ackType);
+               ", тип=" + String(note.ackType) +
+               String(", msgId=") + String(extractMsgId(note.baseSeq));
 
   if (note.ackType == kAckTypeSuccess) {
     log += " (все пакеты получены)";
@@ -2290,63 +2419,66 @@ void processIncomingParityFrame(uint16_t seq,
     addEvent("Получен усечённый PAR-кадр");
     return;
   }
+  const uint8_t msgId = extractMsgId(seq);
+  PerMessageRx& pm = state.rxSessions[msgId];
 
   const size_t payloadAvailable = std::min<size_t>(kFramePayloadSize, frame.size() - 3);
-  std::copy_n(frame.begin() + 3, payloadAvailable, state.rxWindow.parityBlock.bytes.begin());
+  std::copy_n(frame.begin() + 3, payloadAvailable, pm.win.parityBlock.bytes.begin());
   if (payloadAvailable < kFramePayloadSize) {
-    std::fill(state.rxWindow.parityBlock.bytes.begin() + payloadAvailable,
-              state.rxWindow.parityBlock.bytes.end(),
+    std::fill(pm.win.parityBlock.bytes.begin() + payloadAvailable,
+              pm.win.parityBlock.bytes.end(),
               0U);
   }
-  state.rxWindow.parityBlock.dataLength = kFramePayloadSize;
-  state.rxWindow.parityLengthXor = lengthField;
-  state.rxWindow.parityValid = true;
+  pm.win.parityBlock.dataLength = kFramePayloadSize;
+  pm.win.parityLengthXor = lengthField;
+  pm.win.parityValid = true;
+  pm.msg.lastActivityMs = millis();
 
-  addEvent(String("Получен паритет по окну base=") + String(state.rxWindow.baseSeq) +
+  addEvent(String("Получен паритет по окну base=") + String(pm.win.baseSeq) +
            ", xorLen=" + String(static_cast<unsigned long>(lengthField)));
 
-  if (attemptParityRecovery()) {
+  if (attemptParityRecoveryFor(pm)) {
     addEvent("Потерянный DATA-блок восстановлен по паритету");
   }
 
   if (ackRequest) {
     const uint8_t expectedCount = static_cast<uint8_t>(std::max<uint8_t>(
-        state.rxWindow.windowSize,
-        (seq >= state.rxWindow.baseSeq)
-            ? static_cast<uint8_t>((seq - state.rxWindow.baseSeq) + 1)
-            : state.rxWindow.windowSize));
-    prepareAck(seq, expectedCount, true);
+        pm.win.windowSize,
+        (extractPart(seq) >= extractPart(pm.win.baseSeq))
+            ? static_cast<uint8_t>((extractPart(seq) - extractPart(pm.win.baseSeq)) + 1)
+            : pm.win.windowSize));
+    prepareAckFor(pm, seq, expectedCount, true);
   }
 }
 
 // --- Попытка восстановить единственный потерянный блок окна ---
-bool attemptParityRecovery() {
-  if (!state.rxWindow.parityValid || state.rxWindow.windowSize == 0) {
+bool attemptParityRecoveryFor(PerMessageRx& pm) {
+  if (!pm.win.parityValid || pm.win.windowSize == 0) {
     return false;
   }
 
-  const uint8_t windowCount = state.rxWindow.windowSize;
+  const uint8_t windowCount = pm.win.windowSize;
   const uint16_t mask = static_cast<uint16_t>((windowCount >= kBitmapWidth)
                                                   ? kBitmapFullMask
                                                   : ((1U << windowCount) - 1U));
-  const uint16_t missingMask = static_cast<uint16_t>((~state.rxWindow.receivedMask) & mask);
+  const uint16_t missingMask = static_cast<uint16_t>((~pm.win.receivedMask) & mask);
   if (missingMask == 0 || __builtin_popcount(missingMask) != 1) {
     return false; // либо всё доставлено, либо потерь несколько
   }
 
   const uint8_t missingBit = static_cast<uint8_t>(__builtin_ctz(missingMask));
-  const uint16_t missingSeq = static_cast<uint16_t>(state.rxWindow.baseSeq + missingBit);
+  const uint16_t missingSeq = static_cast<uint16_t>(pm.win.baseSeq + missingBit);
 
-  DataBlock recovered = state.rxWindow.parityBlock;
-  uint8_t missingLength = state.rxWindow.parityLengthXor;
+  DataBlock recovered = pm.win.parityBlock;
+  uint8_t missingLength = pm.win.parityLengthXor;
 
   for (uint8_t bit = 0; bit < windowCount; ++bit) {
     if (bit == missingBit) {
       continue;
     }
-    const uint16_t seq = static_cast<uint16_t>(state.rxWindow.baseSeq + bit);
-    auto it = state.rxMessage.pending.find(seq);
-    if (it == state.rxMessage.pending.end()) {
+    const uint16_t seq = static_cast<uint16_t>(pm.win.baseSeq + bit);
+    auto it = pm.msg.pending.find(seq);
+    if (it == pm.msg.pending.end()) {
       return false; // ждём остальные кадры окна
     }
     const DataBlock& known = it->second;
@@ -2357,11 +2489,11 @@ bool attemptParityRecovery() {
   }
 
   recovered.dataLength = std::min<uint8_t>(missingLength, static_cast<uint8_t>(kFramePayloadSize));
-  state.rxMessage.pending[missingSeq] = recovered;
-  state.rxWindow.receivedMask |= static_cast<uint16_t>(1U << missingBit);
-  state.rxWindow.parityValid = false;
+  pm.msg.pending[missingSeq] = recovered;
+  pm.win.receivedMask |= static_cast<uint16_t>(1U << missingBit);
+  pm.win.parityValid = false;
 
-  flushPendingData();
+  flushPendingDataFor(pm);
   return true;
 }
 
@@ -2371,43 +2503,74 @@ void processIncomingFinFrame(const std::vector<uint8_t>& frame) {
     addEvent("Получен усечённый FIN");
     return;
   }
-  if (!state.rxMessage.active) {
-    state.rxMessage.active = true;
-    state.rxMessage.nextExpectedSeq = state.rxWindow.baseSeq;
-    state.rxMessage.buffer.clear();
-    state.rxMessage.pending.clear();
+  // Извлекаем идентификатор сообщения, если передан в байте 5
+  uint8_t finMsgId = (frame.size() >= 6) ? static_cast<uint8_t>(frame[5] & 0x0F) : 0xFF;
+  PerMessageRx* pmPtr = nullptr;
+  if (finMsgId != 0xFF) {
+    pmPtr = &state.rxSessions[finMsgId];
+  } else {
+    // Совместимость со старым передатчиком без msgId в FIN:
+    // если активна ровно одна сессия — завершаем её; иначе — игнорируем FIN
+    if (state.rxSessions.size() == 1) {
+      pmPtr = &state.rxSessions.begin()->second;
+      addEvent(F("FIN без msgId — завершаем единственную активную сессию"));
+    } else {
+      addEvent(F("FIN без msgId при нескольких сессиях — проигнорирован"));
+      return;
+    }
   }
+  PerMessageRx& pm = *pmPtr;
+  if (!pm.msg.active) {
+    pm.msg.active = true;
+    pm.msg.nextExpectedSeq = pm.win.baseSeq;
+    pm.msg.buffer.clear();
+    pm.msg.pending.clear();
+    pm.msg.partCountFromPrefix = false;
+    pm.msg.partCountFromSuffix = false;
+    pm.msg.announcedPartCount = 0;
+  }
+  pm.msg.lastActivityMs = millis();
   uint16_t length = static_cast<uint16_t>(frame[1]) | (static_cast<uint16_t>(frame[2]) << 8);
   uint16_t crc = static_cast<uint16_t>(frame[3]) | (static_cast<uint16_t>(frame[4]) << 8);
-  state.rxMessage.declaredLength = length;
-  state.rxMessage.declaredCrc = crc;
-  state.rxMessage.finReceived = true;
-  flushPendingData();
+  pm.msg.declaredLength = length;
+  pm.msg.declaredCrc = crc;
+  pm.msg.finReceived = true;
+  flushPendingDataFor(pm);
 }
 
 // --- Подготовка и отправка ACK ---
-void prepareAck(uint16_t /*seq*/, uint8_t windowSize, bool forceSend) {
-  if (!state.rxWindow.active) {
+void prepareAckFor(PerMessageRx& pm, uint16_t /*seq*/, uint8_t windowSize, bool forceSend) {
+  if (!pm.win.active) {
     return;
   }
-  const uint8_t effectiveWindow = std::max<uint8_t>(state.rxWindow.windowSize, windowSize);
+  const uint8_t effectiveWindow = std::max<uint8_t>(pm.win.windowSize, windowSize);
   uint16_t mask = static_cast<uint16_t>((effectiveWindow >= kBitmapWidth) ? kBitmapFullMask
                                                                          : ((1U << effectiveWindow) - 1U));
-  const uint16_t missing = static_cast<uint16_t>((~state.rxWindow.receivedMask) & mask);
+  const uint16_t missing = static_cast<uint16_t>((~pm.win.receivedMask) & mask);
   const bool needParity = (state.protocol.harq && missing != 0);
   if (!forceSend && missing == 0) {
     return;
   }
-  const uint16_t base = state.rxWindow.baseSeq;
-  const String windowStatus = formatWindowReceptionStatus(state.rxWindow.receivedMask, effectiveWindow);
-  addEvent(String("Статус пакетов окна base=") + String(base) + ": " + windowStatus);
+  const uint16_t base = pm.win.baseSeq;
+  const uint8_t mid = extractMsgId(base);
+  const String windowStatus = formatWindowReceptionStatus(pm.win.receivedMask, effectiveWindow);
+  addEvent(String("[msgId=") + String(mid) + "] Статус пакетов окна base=" + String(base) + ": " + windowStatus);
+  // Делаем короткую паузу (SIFS), чтобы передающая сторона успела перейти в RX и принять ACK
+#if defined(ARDUINO)
+  delay(computeAckTurnaroundDelayMs());
+#else
+  std::this_thread::sleep_for(std::chrono::milliseconds(computeAckTurnaroundDelayMs()));
+#endif
+  // Предотвращаем прыжок FHSS на время отправки ACK
+  fhssSuspend();
   sendAck(base, missing, needParity, effectiveWindow);
-  state.rxWindow.baseSeq = static_cast<uint16_t>(base + effectiveWindow);
-  state.rxWindow.receivedMask = 0;
-  state.rxWindow.windowSize = 0;
-  state.rxWindow.parityValid = false;
-  state.rxWindow.parityBlock = {};
-  state.rxWindow.parityLengthXor = 0;
+  fhssResume();
+  pm.win.baseSeq = static_cast<uint16_t>(base + effectiveWindow);
+  pm.win.receivedMask = 0;
+  pm.win.windowSize = 0;
+  pm.win.parityValid = false;
+  pm.win.parityBlock = {};
+  pm.win.parityLengthXor = 0;
 }
 
 void sendAck(uint16_t baseSeq, uint16_t missingBitmap, bool needParity, uint8_t windowSize) {
@@ -2416,46 +2579,105 @@ void sendAck(uint16_t baseSeq, uint16_t missingBitmap, bool needParity, uint8_t 
   transmitFrame(frame, F("ACK"));
 }
 
-// --- Сборка последовательных блоков ---
-void flushPendingData() {
-  if (!state.rxMessage.active) {
+// --- Сборка последовательных блоков для конкретного msgId ---
+void flushPendingDataFor(PerMessageRx& pm) {
+  if (!pm.msg.active) {
     return;
   }
 
   bool progressed = true;
   while (progressed) {
     progressed = false;
-    auto it = state.rxMessage.pending.find(state.rxMessage.nextExpectedSeq);
-    if (it == state.rxMessage.pending.end()) {
+    auto it = pm.msg.pending.find(pm.msg.nextExpectedSeq);
+    if (it == pm.msg.pending.end()) {
       break;
     }
     const DataBlock& block = it->second;
-    state.rxMessage.buffer.insert(state.rxMessage.buffer.end(),
-                                  block.bytes.begin(),
-                                  block.bytes.begin() + block.dataLength);
-    state.rxMessage.pending.erase(it);
-    state.rxMessage.nextExpectedSeq = static_cast<uint16_t>(state.rxMessage.nextExpectedSeq + 1);
+    pm.msg.buffer.insert(pm.msg.buffer.end(),
+                         block.bytes.begin(),
+                         block.bytes.begin() + block.dataLength);
+    pm.msg.pending.erase(it);
+    pm.msg.nextExpectedSeq = static_cast<uint16_t>(pm.msg.nextExpectedSeq + 1);
     progressed = true;
+    pm.msg.lastProgressMs = millis();
   }
 
-  if (state.rxMessage.finReceived && state.rxMessage.pending.empty()) {
-    if (state.rxMessage.declaredLength <= state.rxMessage.buffer.size()) {
-      state.rxMessage.buffer.resize(state.rxMessage.declaredLength);
-      const uint16_t crc = crc16Ccitt(state.rxMessage.buffer.data(), state.rxMessage.buffer.size());
-      if (crc == state.rxMessage.declaredCrc) {
-        logReceivedMessage(state.rxMessage.buffer);
+  if (!pm.msg.partCountFromPrefix &&
+      pm.msg.buffer.size() >= kPartCountFieldSize) {
+    // Сохраняем предварительное значение из префикса, но не логируем его,
+    // чтобы не вводить в заблуждение, если приём начался не с первой части
+    pm.msg.announcedPartCount = readUint16Le(pm.msg.buffer.data());
+    pm.msg.partCountFromPrefix = true;
+  }
+
+  if (pm.msg.finReceived && pm.msg.pending.empty()) {
+    const size_t requiredBytes = static_cast<size_t>(pm.msg.declaredLength) + kPartCountMetadataBytes;
+    bool payloadReady = false;
+    std::vector<uint8_t> payload;
+
+    if (pm.msg.buffer.size() >= requiredBytes) {
+      if (!pm.msg.partCountFromSuffix &&
+          pm.msg.buffer.size() >= kPartCountMetadataBytes) {
+        const size_t suffixOffset = pm.msg.buffer.size() - kPartCountFieldSize;
+        const uint16_t suffixValue = readUint16Le(pm.msg.buffer.data() + suffixOffset);
+        pm.msg.partCountFromSuffix = true;
+        if (pm.msg.partCountFromPrefix && suffixValue != pm.msg.announcedPartCount) {
+          addEvent(String("Предупреждение: последний пакет сообщил ") +
+                   String(static_cast<unsigned long>(suffixValue)) +
+                   " частей вместо " +
+                   String(static_cast<unsigned long>(pm.msg.announcedPartCount)));
+        } else if (!pm.msg.partCountFromPrefix) {
+          pm.msg.announcedPartCount = suffixValue;
+          addEvent(String("Последний пакет сообщил ") +
+                   String(static_cast<unsigned long>(suffixValue)) +
+                   " частей");
+        }
+      }
+
+      if (pm.msg.buffer.size() >= kPartCountFieldSize + pm.msg.declaredLength) {
+        const auto payloadBegin = pm.msg.buffer.begin() + kPartCountFieldSize;
+        const auto payloadEnd = payloadBegin + pm.msg.declaredLength;
+        payload.assign(payloadBegin, payloadEnd);
+        payloadReady = true;
+      } else {
+        addEvent("Недостаточно полезных данных после метаданных — сообщение отброшено");
+      }
+    } else {
+      addEvent(String("FIN ожидал ") +
+               String(static_cast<unsigned long>(requiredBytes)) +
+               " байт с учётом метаданных, получено " +
+               String(static_cast<unsigned long>(pm.msg.buffer.size())) +
+               " — сообщение отброшено");
+    }
+
+    if (payloadReady) {
+      const uint16_t crc = crc16Ccitt(payload.data(), payload.size());
+      if (crc == pm.msg.declaredCrc) {
+        const uint8_t mid = extractMsgId(pm.win.baseSeq);
+        addEvent(String("Сообщение собрано (msgId=") + String(mid) + ", байт=" +
+                 String(static_cast<unsigned long>(payload.size())) + ")");
+        logReceivedMessage(payload);
       } else {
         addEvent("CRC-16 FIN не сошёлся — сообщение отброшено");
       }
-    } else {
-      addEvent("FIN сообщил длину больше собранной — сообщение отброшено");
     }
-    state.rxMessage.active = false;
-    state.rxMessage.pending.clear();
-    state.rxMessage.buffer.clear();
-    state.rxMessage.finReceived = false;
-    state.rxWindow.active = false;
-    state.rxWindow.receivedMask = 0;
-    state.rxWindow.windowSize = 0;
+
+    pm.msg.active = false;
+    pm.msg.pending.clear();
+    pm.msg.buffer.clear();
+    pm.msg.finReceived = false;
+    pm.msg.partCountFromPrefix = false;
+    pm.msg.partCountFromSuffix = false;
+    pm.msg.announcedPartCount = 0;
+    pm.win.active = false;
+    pm.win.receivedMask = 0;
+    pm.win.windowSize = 0;
+    // Удаляем готовую сессию
+    for (auto it = state.rxSessions.begin(); it != state.rxSessions.end(); ++it) {
+      if (&(it->second) == &pm) {
+        state.rxSessions.erase(it);
+        break;
+      }
+    }
   }
 }
