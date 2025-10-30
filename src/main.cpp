@@ -23,6 +23,29 @@
 
 #include "libs/radio/lora_radiolib_settings.h"     // дефолтные настройки драйвера SX1262
 
+// --- Переопределяем пины радиомодуля через макросы (по умолчанию — под ESP32 DevKit V1) ---
+#ifndef RADIO_SCK
+#  define RADIO_SCK   18   // SCK  (ESP32 DevKit V1 VSPI)
+#endif
+#ifndef RADIO_MISO
+#  define RADIO_MISO  19   // MISO (ESP32 DevKit V1 VSPI)
+#endif
+#ifndef RADIO_MOSI
+#  define RADIO_MOSI  23   // MOSI (ESP32 DevKit V1 VSPI)
+#endif
+#ifndef RADIO_CS
+#  define RADIO_CS     5   // NSS/CS
+#endif
+#ifndef RADIO_DIO1
+#  define RADIO_DIO1  14   // DIO1 (IRQ)
+#endif
+#ifndef RADIO_RST
+#  define RADIO_RST   27   // RESET
+#endif
+#ifndef RADIO_BUSY
+#  define RADIO_BUSY  25   // BUSY
+#endif
+
 namespace {
 constexpr auto kRadioDefaults = LoRaRadioLibSettings::DEFAULT_OPTIONS; // Статический набор настроек RadioLib
 constexpr size_t kImplicitPayloadLength = static_cast<size_t>(kRadioDefaults.implicitPayloadLength); // размер implicit-пакета
@@ -59,8 +82,13 @@ static constexpr float TX_HOME[HOME_BANK_SIZE] = {
 #endif
 
 // --- Глобальные объекты периферии ---
+// На ESP32-C3 нет VSPI/HSPI, используем глобальный SPI; на классическом ESP32 — VSPI.
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+SPIClass& radioSPI = SPI;                         // общий SPI для ESP32-C3
+#else
 SPIClass radioSPI(VSPI);                          // аппаратный SPI-порт, обслуживающий радиомодуль
-SX1262 radio = new Module(5, 14, 27, 25, radioSPI); // используем VSPI сразу при создании объекта Module
+#endif
+SX1262 radio = new Module(RADIO_CS, RADIO_DIO1, RADIO_RST, RADIO_BUSY, radioSPI); // пины берём из макросов
 WebServer server(80);                             // встроенный HTTP-сервер ESP32
 
 // --- Константы проекта ---
@@ -227,9 +255,24 @@ struct FhssConfig {
   uint8_t suspendDepth = 0;                                          // глубина временной заморозки прыжков
 };
 
+// Повторная отправка и голосование по тройным копиям
+struct TripleVoteEntry {
+  std::array<std::array<uint8_t, kFixedFrameSize>, 3> frames{}; // копии принятого кадра
+  uint8_t count = 0;                                             // сколько копий накоплено (0..3)
+  unsigned long firstMs = 0;                                     // отметка времени первой копии
+};
+
+struct TripleVoteState {
+  bool enabledTx = false;                                        // тройная отправка на TX
+  bool enabledRx = false;                                        // голосование на RX
+  unsigned long holdMs = 25;                                     // максимальная задержка ожидания 3-й копии
+  std::map<uint16_t, TripleVoteEntry> pending;                   // по SEQ для DATA-кадров
+};
+
 struct AppState {
   uint8_t channelIndex = 0;            // выбранный канал банка HOME (фиксированный режим)
   bool highPower = false;              // признак использования мощности 22 dBm (иначе -5 dBm)
+  bool rxBoostedGain = kRadioDefaults.rxBoostedGain; // режим усиленного приёма LNA
   uint8_t selectedSpreadingFactor = kDefaultSpreadingFactor; // выбранный пользователем SF
   float currentRxFreq = frequency_tables::RX_HOME[0]; // текущая частота приёма
   float currentTxFreq = frequency_tables::TX_HOME[0]; // текущая частота передачи
@@ -248,6 +291,7 @@ struct AppState {
   size_t implicitPayloadLength = kImplicitPayloadLength; // актуальная длина фиксированного LoRa-пакета
   uint8_t nextMessageId = 0;           // идентификатор для следующего исходящего сообщения (0..15)
   std::map<uint8_t, PerMessageRx> rxSessions; // параллельные сборки по msgId
+  TripleVoteState triple;              // состояние тройной защиты (TX/ RX)
 } state;
 
 // --- Флаги приёма LoRa ---
@@ -266,6 +310,7 @@ void handleRoot();
 void handleLog();
 void handleChannelChange();
 void handlePowerToggle();
+void handleRxBoostToggle();
 void handleSendLongPacket();
 void handleSendRandomPacket();
 void handleSendCustom();
@@ -275,6 +320,7 @@ void handleSpreadingFactorChange();
 void handleFhssToggle();
 void handleTcxoConfig();
 void handleLdroToggle();
+void handleTcxoCheck();
 String buildIndexHtml();
 String buildChannelOptions(uint8_t selected);
 String escapeJson(const String& value);
@@ -360,32 +406,34 @@ void configureNarrowbandRxOptions();
 void logRxTimingEvent(const String& message);
 void maybeResetStalledReception();
 void finalizeSessionWithoutFin(uint8_t msgId, PerMessageRx& pm);
+// Тройная защита: функции
+bool tripleRxMaybeDecide(uint16_t seq, const std::vector<uint8_t>& frame, std::vector<uint8_t>& decided);
+void tripleCleanupStale();
 
-// --- Формирование имени Wi-Fi сети ---
+// --- Формирование имени Wi‑Fi: BASE_UPPER + '_' + MAC6 ---
 String makeAccessPointSsid() {
   String base = LOTEST_WIFI_SSID;              // базовый SSID из настроек теста
+  base.toUpperCase();                          // требуемый формат: SAT_AP_XXXXXX
 #if defined(ARDUINO)
-  uint32_t suffix = 0;                         // уникальный суффикс для совпадения с основной прошивкой
+  uint8_t macBytes[6] = {0};
 #  if defined(ESP32)
-  uint64_t mac = ESP.getEfuseMac();            // используем eFuse MAC для воспроизведения поведения оригинала
-  suffix = static_cast<uint32_t>(mac & 0xFFFFFFULL);
+  WiFi.macAddress(macBytes);                   // байтовый MAC для максимальной переносимости
 #  elif defined(ESP8266)
-  suffix = ESP.getChipId() & 0xFFFFFFU;        // совместимая логика для других платформ
+  uint32_t chip = ESP.getChipId();
+  macBytes[3] = (chip >> 16) & 0xFF;
+  macBytes[4] = (chip >> 8) & 0xFF;
+  macBytes[5] = (chip) & 0xFF;
 #  else
-  uint8_t mac[6] = {0};
-  WiFi.macAddress(mac);                        // fallback: читаем MAC из Wi-Fi интерфейса
-  suffix = (static_cast<uint32_t>(mac[3]) << 16) |
-           (static_cast<uint32_t>(mac[4]) << 8) |
-           static_cast<uint32_t>(mac[5]);
+  WiFi.macAddress(macBytes);
 #  endif
-  char buf[8];
-  std::snprintf(buf, sizeof(buf), "%06X", static_cast<unsigned>(suffix));
-  base += "-";
-  base += buf;
+  char mac12[13];
+  std::snprintf(mac12, sizeof(mac12), "%02X%02X%02X%02X%02X%02X",
+                macBytes[0], macBytes[1], macBytes[2], macBytes[3], macBytes[4], macBytes[5]);
+  // Формат SSID: SAT_AP_AABBCCDDEEFF — полные 6 байт MAC для исключения коллизий
+  return base + "_" + String(mac12);
 #else
-  base += "-000000";                           // стабы для хостовых тестов без Arduino
+  return base + String("_000000000000");       // стабы для хостовых тестов без Arduino
 #endif
-  return base;
 }
 
 // --- Инициализация оборудования ---
@@ -397,8 +445,24 @@ void setup() {
 
   initFhssDefaults();
 
+  // Настройка тройной защиты по макросам сборки
+#ifdef LOTEST_TRIPLE_RETX
+  state.triple.enabledTx = (LOTEST_TRIPLE_RETX != 0);
+#endif
+#ifdef LOTEST_TRIPLE_RXVOTE
+  state.triple.enabledRx = (LOTEST_TRIPLE_RXVOTE != 0);
+#endif
+#ifdef LOTEST_TRIPLE_HOLD_MS
+  state.triple.holdMs = static_cast<unsigned long>(LOTEST_TRIPLE_HOLD_MS);
+#endif
+  if (state.triple.enabledTx || state.triple.enabledRx) {
+    addEvent(String("Тройная защита: TX=") + (state.triple.enabledTx ? "on" : "off") +
+             ", RX=" + (state.triple.enabledRx ? "on" : "off") +
+             ", hold=" + String(state.triple.holdMs) + " мс");
+  }
+
   // Настройка SPI для радиомодуля SX1262
-  radioSPI.begin(18, 19, 23, 5); // VSPI: SCK=18, MISO=19, MOSI=23, SS=5
+  radioSPI.begin(RADIO_SCK, RADIO_MISO, RADIO_MOSI, RADIO_CS);
 
   // Подключаем обработчик прерывания по DIO1 для асинхронного приёма
   radio.setDio1Action(onRadioDio1Rise);
@@ -418,7 +482,7 @@ void setup() {
                                    initialPowerDbm,
                                    kRadioDefaults.preambleLength,
                                    tcxoVoltage,
-                                   kRadioDefaults.enableRegulatorDCDC);
+                                   kRadioDefaults.enableRegulatorLDO);
   if (beginState != RADIOLIB_ERR_NONE) {
     logRadioError("radio.begin", beginState);
   } else {
@@ -442,7 +506,19 @@ void setup() {
 
     radio.setDio2AsRfSwitch(kRadioDefaults.useDio2AsRfSwitch);
     if (kRadioDefaults.useDio3ForTcxo && kRadioDefaults.tcxoVoltage > 0.0f) {
-      radio.setTCXO(kRadioDefaults.tcxoVoltage); // включаем внешний TCXO с указанным напряжением
+      int16_t tcxoRc = radio.setTCXO(kRadioDefaults.tcxoVoltage, kRadioDefaults.tcxoDelayUs); // включаем внешний TCXO и задаём задержку прогрева
+      if (tcxoRc == RADIOLIB_ERR_NONE) {
+        addEvent(String("TCXO включён на DIO3: V=") + String(kRadioDefaults.tcxoVoltage, 2) +
+                 String(" В, задержка=") + String(static_cast<unsigned long>(kRadioDefaults.tcxoDelayUs)) +
+                 String(" мкс, преамбула=") + String(kRadioDefaults.preambleLength));
+      } else {
+        logRadioError("setTCXO (boot)", tcxoRc);
+        addEvent(String("TCXO включение не подтверждено, продолжаем с указанными параметрами: V=") +
+                 String(kRadioDefaults.tcxoVoltage, 2) + String(" В, задержка=") +
+                 String(static_cast<unsigned long>(kRadioDefaults.tcxoDelayUs)) + String(" мкс"));
+      }
+    } else {
+      addEvent(String("TCXO отключён (XTAL), преамбула=") + String(kRadioDefaults.preambleLength));
     }
     if (kRadioDefaults.implicitHeader) {
       radio.implicitHeader(kImplicitPayloadLength);
@@ -457,7 +533,7 @@ void setup() {
     } else {
       state.rxTiming.preambleSymbols = kRadioDefaults.preambleLength;
     }
-    radio.setRxBoostedGainMode(kRadioDefaults.rxBoostedGain); // режим усиленного приёма SX1262
+    radio.setRxBoostedGainMode(state.rxBoostedGain); // режим усиленного приёма SX1262
     radio.setSyncWord(kRadioDefaults.syncWord);
 
     configureNarrowbandRxOptions();
@@ -473,6 +549,14 @@ void setup() {
   // Поднимаем точку доступа для веб-интерфейса
   WiFi.mode(WIFI_MODE_AP);
   String ssid = makeAccessPointSsid();
+#if defined(ESP32) || defined(ESP8266)
+  uint8_t macBytes[6] = {0};
+  WiFi.macAddress(macBytes);
+  char mac12[13];
+  std::snprintf(mac12, sizeof(mac12), "%02X%02X%02X%02X%02X%02X",
+                macBytes[0], macBytes[1], macBytes[2], macBytes[3], macBytes[4], macBytes[5]);
+  addEvent(String("HW MAC (eFuse/NVS): ") + String(mac12));
+#endif
   bool apStarted = WiFi.softAP(ssid.c_str(), LOTEST_WIFI_PASS);
   if (apStarted) {
     addEvent(String("Точка доступа запущена: ") + ssid);
@@ -486,6 +570,7 @@ void setup() {
   server.on("/api/log", HTTP_GET, handleLog);
   server.on("/api/channel", HTTP_POST, handleChannelChange);
   server.on("/api/power", HTTP_POST, handlePowerToggle);
+  server.on("/api/rxboost", HTTP_POST, handleRxBoostToggle);
   server.on("/api/send/five", HTTP_POST, handleSendLongPacket); // совместимость с прежним маршрутом
   server.on("/api/send/fixed", HTTP_POST, handleSendLongPacket);
   server.on("/api/send/long", HTTP_POST, handleSendLongPacket);
@@ -494,6 +579,7 @@ void setup() {
   server.on("/api/sf", HTTP_POST, handleSpreadingFactorChange);
   server.on("/api/fhss", HTTP_POST, handleFhssToggle);
   server.on("/api/tcxo", HTTP_POST, handleTcxoConfig);
+  server.on("/api/tcxo/check", HTTP_POST, handleTcxoCheck);
   server.on("/api/ldro", HTTP_POST, handleLdroToggle);
   server.on("/api/implicit", HTTP_POST, handleImplicitLenChange);
   server.on("/api/protocol", HTTP_POST, handleProtocolToggle);
@@ -524,8 +610,8 @@ void processRadioEvents() {
 #endif
 
   if (processIrq) {
-    const uint32_t irqFlags = static_cast<uint32_t>(radio.getIrqStatus()); // современный API
-    radio.clearIrqStatus();                                               // очистка IRQ
+    const uint32_t irqFlags = radio.getIrqFlags(); // чтение IRQ-флагов RadioLib
+    (void)radio.clearIrqFlags(irqFlags);           // очистка прочитанных флагов
     String irqMessage = formatSx1262IrqFlags(irqFlags);               // публикуем расшифровку событий с таймингом
     if (state.rxTiming.lastSetRxMs != 0) {
       const unsigned long delta = millis() - state.rxTiming.lastSetRxMs;
@@ -536,6 +622,7 @@ void processRadioEvents() {
 
   if (!packetReceivedFlag) {
     // Периодически проверяем зависшую сборку сообщения
+    tripleCleanupStale();
     maybeResetStalledReception();
     return;
   }
@@ -566,6 +653,7 @@ void processRadioEvents() {
   packetProcessingEnabled = true;
 
   // После обработки пакета также проверим зависание сборки
+  tripleCleanupStale();
   maybeResetStalledReception();
 }
 
@@ -576,6 +664,75 @@ void IRAM_ATTR onRadioDio1Rise() {
     return;
   }
   packetReceivedFlag = true;
+}
+
+// --- Тройная защита: удалить устаревшие заготовки ---
+void tripleCleanupStale() {
+  if (!state.triple.enabledRx || state.triple.pending.empty()) {
+    return;
+  }
+  const unsigned long now = millis();
+  for (auto it = state.triple.pending.begin(); it != state.triple.pending.end(); ) {
+    if (now - it->second.firstMs > state.triple.holdMs) {
+      it = state.triple.pending.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+// --- Тройная защита: накопить до 3 копий и принять решение ---
+bool tripleRxMaybeDecide(uint16_t seq, const std::vector<uint8_t>& frame, std::vector<uint8_t>& decided) {
+  // Безопасность
+  if (frame.size() != kFixedFrameSize) {
+    decided = frame; // fallback: не пытаемся голосовать
+    return true;
+  }
+
+  TripleVoteEntry& e = state.triple.pending[seq];
+  if (e.count == 0) {
+    std::copy_n(frame.begin(), kFixedFrameSize, e.frames[0].begin());
+    e.count = 1;
+    e.firstMs = millis();
+    return false; // ждём вторую/третью копию
+  }
+
+  // Если совпадает с уже имеющейся копией — принимаем немедленно
+  for (uint8_t i = 0; i < e.count; ++i) {
+    if (std::equal(frame.begin(), frame.end(), e.frames[i].begin())) {
+      decided.assign(e.frames[i].begin(), e.frames[i].end());
+      state.triple.pending.erase(seq);
+      return true;
+    }
+  }
+
+  if (e.count < 3) {
+    std::copy_n(frame.begin(), kFixedFrameSize, e.frames[e.count].begin());
+    ++e.count;
+  }
+
+  if (e.count < 3) {
+    // Пока есть только 2 разные копии — ждём третью
+    return false;
+  }
+
+  // Есть три копии, применяем помехоустойчивое решение по байтам
+  std::array<uint8_t, kFixedFrameSize> out{};
+  for (size_t b = 0; b < kFixedFrameSize; ++b) {
+    uint8_t v0 = e.frames[0][b];
+    uint8_t v1 = e.frames[1][b];
+    uint8_t v2 = e.frames[2][b];
+    if (v0 == v1 || v0 == v2) {
+      out[b] = v0;
+    } else if (v1 == v2) {
+      out[b] = v1;
+    } else {
+      out[b] = v0; // нет большинства — берём первую копию
+    }
+  }
+  decided.assign(out.begin(), out.end());
+  state.triple.pending.erase(seq);
+  return true;
 }
 
 // --- Формирование человекочитаемого описания IRQ SX1262 ---
@@ -772,6 +929,21 @@ void handlePowerToggle() {
   }
 }
 
+// --- API: переключение усиленного приёма (LNA Boost) ---
+void handleRxBoostToggle() {
+  bool enable = server.hasArg("enable") && server.arg("enable") == "1";
+  int16_t rc = radio.setRxBoostedGainMode(enable);
+  if (rc != RADIOLIB_ERR_NONE) {
+    logRadioError("setRxBoostedGainMode", rc);
+    server.send(500, "application/json", "{\"error\":\"Не удалось переключить усиленный приём\"}");
+    return;
+  }
+  state.rxBoostedGain = enable;
+  addEvent(String("Усиленный приём (LNA Boost) ") + (enable ? "включён" : "выключен"));
+  ensureReceiveMode();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 // --- API: установка фактора расширения ---
 void handleSpreadingFactorChange() {
   if (!server.hasArg("sf")) {
@@ -818,6 +990,12 @@ void handleFhssToggle() {
 void handleLdroToggle() {
   bool handled = false;
   if (server.hasArg("auto") && server.arg("auto") == "1") {
+    int16_t rc = radio.autoLDRO();
+    if (rc != RADIOLIB_ERR_NONE) {
+      logRadioError("autoLDRO", rc);
+      server.send(500, "application/json", "{\"error\":\"Не удалось вернуть LDRO в AUTO\"}");
+      return;
+    }
     state.rxTiming.ldroOverrideActive = false;
     handled = true;
   }
@@ -825,9 +1003,9 @@ void handleLdroToggle() {
     bool en = (server.arg("on") == "1");
     state.rxTiming.ldroOverrideActive = true;
     state.rxTiming.ldroOverrideValue = en;
-    int16_t rc = radio.setLowDataRateOptimization(en);
+    int16_t rc = radio.forceLDRO(en);
     if (rc != RADIOLIB_ERR_NONE) {
-      logRadioError("setLowDataRateOptimization", rc);
+      logRadioError("forceLDRO", rc);
       server.send(500, "application/json", "{\"error\":\"Не удалось применить LDRO\"}");
       return;
     }
@@ -862,9 +1040,8 @@ void handleTcxoConfig() {
 
   int16_t rc = radio.setTCXO(enable ? voltage : 0.0f);
   if (rc != RADIOLIB_ERR_NONE) {
-    logRadioError("setTCXO", rc);
-    server.send(500, "application/json", "{\"error\":\"Не удалось применить TCXO\"}");
-    return;
+    // Отключена строгая проверка TCXO: логируем, но не считаем ошибкой
+    logRadioError("setTCXO (ignored)", rc);
   }
 
   addEvent(String("TCXO ") + (enable ? "включён, V=" + String(voltage, 2) + " В" : "выключен"));
@@ -872,6 +1049,33 @@ void handleTcxoConfig() {
   (void)applyRadioChannel(state.channelIndex);
   ensureReceiveMode();
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// --- API: проверка статуса TCXO и логирование ---
+void handleTcxoCheck() {
+  bool configured = (kRadioDefaults.useDio3ForTcxo && kRadioDefaults.tcxoVoltage > 0.0f);
+  if (!configured) {
+    addEvent(String("Проверка TCXO: выключен (XTAL), преамбула=") + String(kRadioDefaults.preambleLength));
+    server.send(200, "application/json",
+                String("{\"enabled\":false,\"preamble\":") + String(kRadioDefaults.preambleLength) + "}");
+    return;
+  }
+
+  int16_t rc = radio.setTCXO(kRadioDefaults.tcxoVoltage, kRadioDefaults.tcxoDelayUs);
+  if (rc == RADIOLIB_ERR_NONE) {
+    addEvent(String("Проверка TCXO: OK, V=") + String(kRadioDefaults.tcxoVoltage, 2) +
+             String(" В, задержка=") + String(static_cast<unsigned long>(kRadioDefaults.tcxoDelayUs)) +
+             String(" мкс, преамбула=") + String(kRadioDefaults.preambleLength));
+  } else {
+    logRadioError("setTCXO (check)", rc);
+    addEvent(String("Проверка TCXO: ошибка ") + String(rc));
+  }
+
+  String json = String("{\"enabled\":true,\"voltage\":") + String(kRadioDefaults.tcxoVoltage, 2) +
+                String(",\"delay_us\":") + String(static_cast<unsigned long>(kRadioDefaults.tcxoDelayUs)) +
+                String(",\"preamble\":") + String(kRadioDefaults.preambleLength) +
+                String(",\"rc\":") + String(rc) + "}";
+  server.send(200, "application/json", json);
 }
 
 // --- API: настройка длины фиксированного LoRa-пакета (implicit header) ---
@@ -1049,6 +1253,11 @@ String buildIndexHtml() {
     html += ">SF" + String(sf) + "</option>";
   }
   html += "</select>";
+  html += "<label><input type='checkbox' id='rxboost'";
+  if (state.rxBoostedGain) {
+    html += " checked";
+  }
+  html += "> Усиленный приём (LNA Boost)</label>";
   html += "<label><input type='checkbox' id='fhss'";
   if (state.fhss.enabled) {
     html += " checked";
@@ -1102,13 +1311,14 @@ String buildIndexHtml() {
   html += F("</div></section>");
 
   html += F("<section><h2>Журнал событий</h2><div id='log'></div></section></main><script>");
-  html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfSelect=document.getElementById('sf');const fhssCb=document.getElementById('fhss');const symCb=document.getElementById('sym');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const ldroCb=document.getElementById('ldro');const statusEl=document.getElementById('status');let lastId=0;");
+  html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfSelect=document.getElementById('sf');const rxboostCb=document.getElementById('rxboost');const fhssCb=document.getElementById('fhss');const symCb=document.getElementById('sym');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const ldroCb=document.getElementById('ldro');const statusEl=document.getElementById('status');let lastId=0;");
   html += F("function appendLog(entry){const div=document.createElement('div');div.className='message';div.textContent=entry.text;if(entry.color){div.style.color=entry.color;}logEl.appendChild(div);logEl.scrollTop=logEl.scrollHeight;}");
   html += F("async function refreshLog(){try{const resp=await fetch(`/api/log?after=${lastId}`);if(!resp.ok)return;const data=await resp.json();data.events.forEach(evt=>{appendLog(evt);lastId=evt.id;});}catch(e){console.error(e);}}");
   html += F("async function postForm(url,body){const resp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(body)});if(!resp.ok){const err=await resp.json().catch(()=>({error:'Неизвестная ошибка'}));throw new Error(err.error||'Ошибка');}}");
   html += F("async function updateProtocol(field,value){const payload={};payload[field]=value?'1':'0';try{await postForm('/api/protocol',payload);statusEl.textContent='Настройки протокола обновлены';refreshLog();}catch(e){statusEl.textContent=e.message;}}");
   html += F("channelSel.addEventListener('change',async()=>{try{await postForm('/api/channel',{channel:channelSel.value});statusEl.textContent='Канал применён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("powerCb.addEventListener('change',async()=>{try{await postForm('/api/power',{high:powerCb.checked?'1':'0'});statusEl.textContent='Мощность обновлена';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
+  html += F("rxboostCb.addEventListener('change',async()=>{try{await postForm('/api/rxboost',{enable:rxboostCb.checked?'1':'0'});statusEl.textContent='Усиленный приём обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("sfSelect.addEventListener('change',async()=>{try{await postForm('/api/sf',{sf:sfSelect.value});statusEl.textContent='Фактор расширения обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("document.getElementById('implenApply').addEventListener('click',async()=>{const val=document.getElementById('implen').value;try{await postForm('/api/implicit',{len:val});statusEl.textContent='Длина фиксированного пакета обновлена';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("fhssCb.addEventListener('change',async()=>{try{await postForm('/api/fhss',{enable:fhssCb.checked?'1':'0'});statusEl.textContent='Статус FHSS обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
@@ -1389,28 +1599,38 @@ void configureNarrowbandRxOptions() {
     }
   }
 
+  // Управление остановкой RX-таймера по преамбуле отсутствует в RadioLib API SX126x
   const bool desiredStop = narrowBandwidth;
   if (desiredStop != state.rxTiming.stopTimerOnPreamble) {
-    const int16_t code = radio.setStopRxTimerOnPreamble(desiredStop);
-    if (code == RADIOLIB_ERR_NONE) {
-      state.rxTiming.stopTimerOnPreamble = desiredStop;
-      logRxTimingEvent(String("StopRxTimerOnPreamble ") + (desiredStop ? "включён" : "выключен"));
-    } else {
-      logRadioError("setStopRxTimerOnPreamble", code);
+    state.rxTiming.stopTimerOnPreamble = desiredStop;
+    if (!state.rxTiming.reportedMissingStopTimerSupport) {
+      state.rxTiming.reportedMissingStopTimerSupport = true;
+      logRxTimingEvent(F("StopRxTimerOnPreamble недоступен в RadioLib — пропускаем"));
     }
   }
 
   const bool computedLdro = (symbolDurationMs >= 16.0f);
   const bool needLdro = state.rxTiming.ldroOverrideActive ? state.rxTiming.ldroOverrideValue : computedLdro;
-  if (needLdro != state.rxTiming.ldroForced) {
-    const int16_t code = radio.setLowDataRateOptimization(needLdro);
+  if (state.rxTiming.ldroOverrideActive) {
+    if (needLdro != state.rxTiming.ldroForced) {
+      const int16_t code = radio.forceLDRO(needLdro);
+      if (code == RADIOLIB_ERR_NONE) {
+        state.rxTiming.ldroForced = needLdro;
+        String src = String(" (manual)");
+        logRxTimingEvent(String("LDRO ") + (needLdro ? "включён" : "выключен") +
+                         String(" (Ts=") + String(symbolDurationMs, 2) + " мс)" + src);
+      } else {
+        logRadioError("forceLDRO", code);
+      }
+    }
+  } else {
+    // AUTO режим: библиотека сама включает LDRO при Ts>=16 мс
+    const int16_t code = radio.autoLDRO();
     if (code == RADIOLIB_ERR_NONE) {
       state.rxTiming.ldroForced = needLdro;
-      String src = state.rxTiming.ldroOverrideActive ? String(" (manual)") : String("");
-      logRxTimingEvent(String("LDRO ") + (needLdro ? "включён" : "выключен") +
-                       String(" (Ts=") + String(symbolDurationMs, 2) + " мс)") + src;
+      logRxTimingEvent(String("LDRO AUTO, Ts=") + String(symbolDurationMs, 2) + " мс → " + (needLdro ? "on" : "off"));
     } else {
-      logRadioError("setLowDataRateOptimization", code);
+      logRadioError("autoLDRO", code);
     }
   }
 
@@ -1427,26 +1647,18 @@ void configureNarrowbandRxOptions() {
   const uint32_t appliedSymbols = useContinuous ? 0U : timeoutSymbols;
   const float timeoutSeconds = useContinuous ? 0.0f : (symbolDurationMs * timeoutSymbols) / 1000.0f;
 
-  bool timeoutConfigured = false;
+  // SX126x в RadioLib не имеет отдельного API setRxTimeout/symb timeout; 
+  // будем просто сохранять желаемые значения и использовать startReceive() при необходимости
   const bool symbolsChangeNeeded =
       (appliedSymbols != state.rxTiming.rxTimeoutSymbols) || (state.rxTiming.rxContinuous != useContinuous);
   if (symbolsChangeNeeded) {
-    const int16_t code = radio.setRxTimeout(timeoutSeconds);
-    if (code == RADIOLIB_ERR_NONE) {
-      state.rxTiming.rxTimeoutSymbols = appliedSymbols;
-      state.rxTiming.rxContinuous = useContinuous;
-      if (useContinuous) {
-        logRxTimingEvent(F("RX переведён в непрерывный режим (SetRx timeout=0)"));
-      } else {
-        logRxTimingEvent(String("RX тайм-аут ≈ ") + String(timeoutSeconds, 2) + " с");
-      }
-      timeoutConfigured = true;
+    state.rxTiming.rxTimeoutSymbols = appliedSymbols;
+    state.rxTiming.rxContinuous = useContinuous;
+    if (useContinuous) {
+      logRxTimingEvent(F("RX в непрерывном режиме (timeout=INF)"));
     } else {
-      logRadioError("setRxTimeout", code);
-      timeoutConfigured = true;
+      logRxTimingEvent(String("Желаемый RX тайм-аут ≈ ") + String(timeoutSeconds, 2) + " с (будет применён при startReceive)");
     }
-  } else {
-    timeoutConfigured = true;
   }
 
   // Таймаут поиска заголовка масштабируем от SF: для SF≥8 даём больший запас символов
@@ -1454,12 +1666,10 @@ void configureNarrowbandRxOptions() {
   const uint16_t desiredSymbTimeout = static_cast<uint16_t>(
       std::min<uint32_t>(255U, static_cast<uint32_t>(targetPreamble + headerReserve)));
   if (desiredSymbTimeout != 0 && desiredSymbTimeout != state.rxTiming.symbTimeout) {
-    const int16_t code = radio.setLoRaSymbNumTimeout(static_cast<uint8_t>(desiredSymbTimeout));
-    if (code == RADIOLIB_ERR_NONE) {
-      state.rxTiming.symbTimeout = desiredSymbTimeout;
-      logRxTimingEvent(String("LoRaSymbNumTimeout установлен в ") + String(desiredSymbTimeout) + " символов");
-    } else {
-      logRadioError("setLoRaSymbNumTimeout", code);
+    state.rxTiming.symbTimeout = desiredSymbTimeout;
+    if (!state.rxTiming.reportedMissingSymbTimeoutSupport) {
+      state.rxTiming.reportedMissingSymbTimeoutSupport = true;
+      logRxTimingEvent(F("LoRaSymbNumTimeout недоступен в RadioLib — пропускаем"));
     }
   }
 }
@@ -1817,14 +2027,25 @@ bool transmitFrame(const std::array<uint8_t, kFixedFrameSize>& frame, const Stri
     }
   }
 
-  int16_t result = radio.transmit(const_cast<uint8_t*>(frame.data()), kFixedFrameSize);
-  if (result != RADIOLIB_ERR_NONE) {
-    logRadioError("transmit", result);
-    if (!sameTxRx) {
-      (void)radio.setFrequency(state.currentRxFreq);
+  // Количество повторов передачи (1 или 3)
+  const uint8_t repeats = state.triple.enabledTx ? 3 : 1;
+  for (uint8_t i = 0; i < repeats; ++i) {
+    if (i > 0) {
+      addEvent(String("→ повтор ") + String(static_cast<unsigned long>(i + 1)) + "/" + String(static_cast<unsigned long>(repeats)));
     }
-    ensureReceiveMode();
-    return false;
+    int16_t result = radio.transmit(const_cast<uint8_t*>(frame.data()), kFixedFrameSize);
+    if (result != RADIOLIB_ERR_NONE) {
+      logRadioError("transmit", result);
+      if (!sameTxRx) {
+        (void)radio.setFrequency(state.currentRxFreq);
+      }
+      ensureReceiveMode();
+      return false;
+    }
+    // Между повторами выдерживаем короткую паузу
+    if (i + 1 < repeats) {
+      waitInterFrameDelay();
+    }
   }
 
   if (!sameTxRx) {
@@ -2264,7 +2485,18 @@ void processIncomingFrame(const std::vector<uint8_t>& frame) {
   const uint8_t type = frame[0] & kFrameTypeMask;
   switch (type) {
     case kFrameTypeData:
-      processIncomingDataFrame(frame);
+      if (state.triple.enabledRx) {
+        const uint16_t seq = (frame.size() >= 3)
+                               ? static_cast<uint16_t>(frame[1]) |
+                                     (static_cast<uint16_t>(frame[2]) << 8)
+                               : 0;
+        std::vector<uint8_t> decided;
+        if (tripleRxMaybeDecide(seq, frame, decided)) {
+          processIncomingDataFrame(decided);
+        }
+      } else {
+        processIncomingDataFrame(frame);
+      }
       break;
     case kFrameTypeAck:
       processIncomingAckFrame(frame);
