@@ -17,6 +17,7 @@
 #include <numeric>
 #include <cmath>
 #include <limits>
+#include <mbedtls/aes.h>
 #if !defined(ARDUINO)
 #include <thread>
 #endif
@@ -99,7 +100,7 @@ constexpr size_t kFixedFrameSize = 8;             // фиксированная 
 constexpr size_t kFramePayloadSize = 5;           // полезная часть кадра согласно спецификации ARQ
 constexpr size_t kPartCountFieldSize = 2;         // число байт, которыми кодируется количество частей
 constexpr size_t kPartCountMetadataBytes = kPartCountFieldSize * 2; // метаданные хранятся в первом и последнем пакете
-constexpr unsigned long kInterFrameDelayMs = 8;   // пауза между кадрами (снижена для ускорения)
+constexpr unsigned long kInterFrameDelayMs = 15;  // пауза между кадрами между кадрами
 constexpr size_t kArqWindowSize = 8;              // размер окна подтверждения ACK
 constexpr size_t kBitmapWidth = 16;               // ширина BITMAP16 для запроса переотправки
 constexpr uint16_t kBitmapFullMask = (1U << kBitmapWidth) - 1U; // полный набор битов BITMAP16
@@ -108,6 +109,98 @@ constexpr size_t kHarqDataBlock = 11;             // число DATA-пакет�
 constexpr size_t kHarqParityCount = 4;            // число PAR-пакетов в HARQ-блоке
 constexpr size_t kLongPacketSize = 124;           // длина длинного пакета с буквами A-Z
 constexpr const char* kIncomingColor = "#5CE16A"; // цвет отображения принятых сообщений
+
+// --- AES-256 CTR настройка ---
+#ifndef LOTEST_AES_KEY_HEX
+// 32-байтный ключ в hex (64 символа). Переопределите через -DLOTEST_AES_KEY_HEX=\"...\"
+#define LOTEST_AES_KEY_HEX "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F"
+#endif
+
+bool hexToBytes(const char* hex, uint8_t* out, size_t outLen) {
+  auto hexVal = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+  };
+  if (!hex) return false;
+  size_t n = 0;
+  for (size_t i = 0; i < outLen; ++i) {
+    if (!hex[n] || !hex[n+1]) return false;
+    int hi = hexVal(hex[n++]);
+    int lo = hexVal(hex[n++]);
+    if (hi < 0 || lo < 0) return false;
+    out[i] = static_cast<uint8_t>((hi << 4) | lo);
+  }
+  return true;
+}
+
+bool aes256CtrCrypt(const uint8_t key[32], const uint8_t iv[16],
+                    const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
+  mbedtls_aes_context ctx;
+  mbedtls_aes_init(&ctx);
+  if (mbedtls_aes_setkey_enc(&ctx, key, 256) != 0) {
+    mbedtls_aes_free(&ctx);
+    return false;
+  }
+  out.resize(in.size());
+  size_t nc_off = 0;
+  unsigned char stream_block[16] = {0};
+  int rc = mbedtls_aes_crypt_ctr(&ctx, in.size(), &nc_off,
+                                 const_cast<unsigned char*>(iv), stream_block,
+                                 in.data(), out.data());
+  mbedtls_aes_free(&ctx);
+  return rc == 0;
+}
+
+// Шифрование полезной нагрузки: IV(16) + CIPHER
+bool encryptPayloadAes256(const std::vector<uint8_t>& plain, std::vector<uint8_t>& out) {
+  uint8_t key[32];
+  if (!hexToBytes(LOTEST_AES_KEY_HEX, key, sizeof(key))) {
+    return false;
+  }
+  uint8_t iv[16];
+#if defined(ESP32) || defined(ESP_PLATFORM)
+  for (int i = 0; i < 16; i += 4) {
+    uint32_t r = esp_random();
+    std::memcpy(iv + i, &r, 4);
+  }
+#else
+  for (int i = 0; i < 16; ++i) {
+    iv[i] = static_cast<uint8_t>(random(0, 256));
+  }
+#endif
+  // В CTR API nonce_counter изменяется по ходу шифрования,
+  // поэтому используем рабочую копию, а исходный IV сохраняем для передачи.
+  uint8_t ivWork[16];
+  std::memcpy(ivWork, iv, sizeof(ivWork));
+  std::vector<uint8_t> cipher;
+  if (!aes256CtrCrypt(key, ivWork, plain, cipher)) {
+    return false;
+  }
+  out.clear();
+  out.insert(out.end(), iv, iv + sizeof(iv));
+  out.insert(out.end(), cipher.begin(), cipher.end());
+  return true;
+}
+
+bool decryptPayloadAes256(const std::vector<uint8_t>& in, std::vector<uint8_t>& plain) {
+  if (in.size() < 16) {
+    return false;
+  }
+  uint8_t key[32];
+  if (!hexToBytes(LOTEST_AES_KEY_HEX, key, sizeof(key))) {
+    return false;
+  }
+  const uint8_t* iv = in.data();
+  uint8_t ivCopy[16];
+  std::memcpy(ivCopy, iv, sizeof(ivCopy));
+  const uint8_t* data = in.data() + 16;
+  const size_t len = in.size() - 16;
+  std::vector<uint8_t> cipher(data, data + len);
+  // Используем локальную копию IV, чтобы не модифицировать входной буфер при расшифровании
+  return aes256CtrCrypt(key, ivCopy, cipher, plain);
+}
 
 // --- Константы формата кадров Lotest ---
 constexpr uint8_t kFrameTypeMask = 0xC0;          // верхние два бита определяют тип кадра
@@ -169,6 +262,7 @@ struct ProtocolConfig {
   bool harq = false;                   // активен ли HARQ (адаптивный FEC)
   bool phyFec = false;                 // использовать ли фиксированный FEC PHY
   bool payloadCrc8 = false;            // добавлять ли CRC-8 к каждому DATA-пакету
+  bool ackEnabled = false;             // использовать ли ACK/ARQ механику
 };
 
 struct RxWindowState {
@@ -271,7 +365,7 @@ struct TripleVoteState {
 
 struct AppState {
   uint8_t channelIndex = 0;            // выбранный канал банка HOME (фиксированный режим)
-  bool highPower = false;              // признак использования мощности 22 dBm (иначе -5 dBm)
+  bool highPower = false;              // признак использования мощности 22 dBm (иначе -9 dBm)
   bool rxBoostedGain = kRadioDefaults.rxBoostedGain; // режим усиленного приёма LNA
   uint8_t selectedSpreadingFactor = kDefaultSpreadingFactor; // выбранный пользователем SF
   float currentRxFreq = frequency_tables::RX_HOME[0]; // текущая частота приёма
@@ -292,6 +386,15 @@ struct AppState {
   uint8_t nextMessageId = 0;           // идентификатор для следующего исходящего сообщения (0..15)
   std::map<uint8_t, PerMessageRx> rxSessions; // параллельные сборки по msgId
   TripleVoteState triple;              // состояние тройной защиты (TX/ RX)
+  unsigned long txIntervalMs = 80;     // интервал между пакетами (40/80/160/240 мс)
+  struct {
+    bool enabled = false;              // режим непрерывных «пилотов» включён
+    uint16_t nextPart = 0;             // счётчик частей для SEQ
+    uint8_t msgId = 0x0F;              // выделенный msgId для пилотов (0..15)
+    std::array<uint8_t, kFramePayloadSize> payload{}; // содержимое DATA
+    uint8_t length = 0;                // фактическая длина полезной нагрузки (0..5)
+    unsigned long lastTxMs = 0;        // время последней отправки для троттлинга
+  } pilot;
 } state;
 
 // --- Флаги приёма LoRa ---
@@ -316,6 +419,8 @@ void handleSendRandomPacket();
 void handleSendCustom();
 void handleNotFound();
 void handleProtocolToggle();
+void handlePilotToggle();
+void handleIntervalChange();
 void handleSpreadingFactorChange();
 void handleFhssToggle();
 void handleTcxoConfig();
@@ -332,6 +437,9 @@ bool applyRadioPower(bool highPower);
 bool applySpreadingFactor(uint8_t spreadingFactor);
 bool applyPhyFec(bool enable);
 bool ensureReceiveMode();
+bool transmitFrameTxOnly(const std::array<uint8_t, kFixedFrameSize>& frame, const String& context);
+void pilotTick();
+void rxKeepAliveTick();
 void processRadioEvents();
 bool sendPayload(const std::vector<uint8_t>& payload, const String& context);
 bool transmitFrame(const std::array<uint8_t, kFixedFrameSize>& frame, const String& context);
@@ -576,6 +684,7 @@ void setup() {
   server.on("/api/send/long", HTTP_POST, handleSendLongPacket);
   server.on("/api/send/random", HTTP_POST, handleSendRandomPacket);
   server.on("/api/send/custom", HTTP_POST, handleSendCustom);
+  server.on("/api/pilot", HTTP_POST, handlePilotToggle);
   server.on("/api/sf", HTTP_POST, handleSpreadingFactorChange);
   server.on("/api/fhss", HTTP_POST, handleFhssToggle);
   server.on("/api/tcxo", HTTP_POST, handleTcxoConfig);
@@ -583,6 +692,7 @@ void setup() {
   server.on("/api/ldro", HTTP_POST, handleLdroToggle);
   server.on("/api/implicit", HTTP_POST, handleImplicitLenChange);
   server.on("/api/protocol", HTTP_POST, handleProtocolToggle);
+  server.on("/api/interval", HTTP_POST, handleIntervalChange);
   server.onNotFound(handleNotFound);
   server.begin();
   addEvent("HTTP-сервер запущен на порту 80");
@@ -593,6 +703,8 @@ void loop() {
   server.handleClient();
   processRadioEvents();
   updateFhss();
+  pilotTick();
+  rxKeepAliveTick();
 }
 
 // --- Обработка радиособытий вне основного цикла ---
@@ -922,7 +1034,8 @@ void handlePowerToggle() {
   bool newHighPower = server.hasArg("high") && server.arg("high") == "1";
   if (applyRadioPower(newHighPower)) {
     state.highPower = newHighPower;
-    addEvent(String("Мощность передачи установлена в ") + (newHighPower ? "22 dBm" : "-5 dBm"));
+    addEvent(String("Мощность передачи установлена в ") +
+            (newHighPower ? String(kHighPowerDbm) + " dBm" : String(kLowPowerDbm) + " dBm"));
     server.send(200, "application/json", "{\"ok\":true}");
   } else {
     server.send(500, "application/json", "{\"error\":\"Ошибка установки мощности\"}");
@@ -1162,6 +1275,70 @@ void handleProtocolToggle() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// --- API: включение/выключение режима «пилотов» ---
+void handlePilotToggle() {
+  if (!server.hasArg("enable")) {
+    server.send(400, "application/json", "{\"error\":\"Не указан параметр enable\"}");
+    return;
+  }
+
+  const bool enable = (server.arg("enable") == "1");
+  if (enable) {
+    // Настраиваем полезную нагрузку пилота
+    state.pilot.payload.fill(0);
+    state.pilot.length = 0;
+    if (server.hasArg("payload")) {
+      String s = server.arg("payload");
+      state.pilot.length = static_cast<uint8_t>(std::min<size_t>(s.length(), kFramePayloadSize));
+      for (uint8_t i = 0; i < state.pilot.length; ++i) {
+        state.pilot.payload[i] = static_cast<uint8_t>(s[i]);
+      }
+    } else {
+      // Значение по умолчанию: "PLT\x00\x00" (или короче)
+      const char* def = "PLT";
+      state.pilot.length = 3;
+      for (uint8_t i = 0; i < state.pilot.length; ++i) {
+        state.pilot.payload[i] = static_cast<uint8_t>(def[i]);
+      }
+    }
+    if (server.hasArg("msgId")) {
+      int mid = server.arg("msgId").toInt();
+      if (mid >= 0 && mid <= 15) {
+        state.pilot.msgId = static_cast<uint8_t>(mid);
+      }
+    }
+    state.pilot.nextPart = 0;
+    state.pilot.enabled = true;
+    addEvent(String("Пилоты включены: msgId=") + String(state.pilot.msgId) +
+             ", len=" + String(static_cast<unsigned long>(state.pilot.length)));
+  } else {
+    state.pilot.enabled = false;
+    addEvent(F("Пилоты выключены"));
+    // Возвращаемся в приём
+    ensureReceiveMode();
+  }
+
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// --- API: смена интервала между пакетами ---
+void handleIntervalChange() {
+  if (!server.hasArg("ms")) {
+    server.send(400, "application/json", "{\"error\":\"Не указан параметр ms\"}");
+    return;
+  }
+  const int ms = server.arg("ms").toInt();
+  if (!(ms == 40 || ms == 80 || ms == 160 || ms == 240)) {
+    server.send(400, "application/json", "{\"error\":\"Допустимые значения: 40,80,160,240\"}");
+    return;
+  }
+  state.txIntervalMs = static_cast<unsigned long>(ms);
+  // Сбросим таймер пилотов, чтобы следующий кадр пошёл по новому интервалу
+  state.pilot.lastTxMs = 0;
+  addEvent(String("Интервал между пакетами: ") + String(ms) + " мс");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 // --- API: отправка длинного пакета с буквами A-Z ---
 void handleSendLongPacket() {
   std::vector<uint8_t> data(kLongPacketSize, 0);
@@ -1221,7 +1398,7 @@ String buildIndexHtml() {
   html.reserve(8192);
   html += F("<!DOCTYPE html><html lang='ru'><head><meta charset='UTF-8'><title>Lotest</title><style>");
   html += F("body{font-family:Arial,sans-serif;margin:0;padding:0;background:#10141a;color:#f0f0f0;}");
-  html += F("header{background:#1f2a38;padding:16px 24px;font-size:20px;font-weight:bold;}");
+  html += F("header{background:#1f2a38;padding:16px 24px;font-size:20px;font-weight:bold;display:flex;align-items:center;justify-content:space-between;}");
   html += F("main{padding:24px;display:flex;gap:24px;flex-wrap:wrap;}");
   html += F("section{background:#1b2330;border-radius:12px;padding:16px;box-shadow:0 4px 12px rgba(0,0,0,0.3);flex:1 1 320px;}");
   html += F("button,select,input[type=text]{background:#2b3648;border:none;border-radius:8px;color:#f0f0f0;padding:8px 12px;margin:4px 0;}");
@@ -1234,7 +1411,12 @@ String buildIndexHtml() {
   html += F(".message{margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,0.1);}");
   html += F(".controls button{width:100%;margin-top:8px;}");
   html += F(".status{font-size:14px;color:#9fb1d1;margin-top:8px;}");
-  html += F("</style></head><body><header>Lotest — тестирование LoRa + веб</header><main>");
+  html += F(".ind{display:flex;gap:14px;align-items:center;font-size:14px;color:#9fb1d1;}");
+  html += F(".ind .cell{display:flex;align-items:center;gap:6px;}");
+  html += F(".dot{width:10px;height:10px;border-radius:50%;background:#2b3648;box-shadow:0 0 0 transparent;display:inline-block;vertical-align:middle;transition:background .15s,box-shadow .15s;}");
+  html += F(".dot.on.rx{background:#22c55e;box-shadow:0 0 8px #22c55e;}");
+  html += F(".dot.on.tx{background:#f97316;box-shadow:0 0 8px #f97316;}");
+  html += F("</style></head><body><header><div>Lotest — тестирование LoRa + веб</div><div class='ind'><div class='cell'><span class='dot rx' id='rxLed'></span><span>RX</span></div><div class='cell'><span class='dot tx' id='txLed'></span><span>TX</span></div></div></header><main>");
 
   html += F("<section><h2>Управление радиомодулем</h2><label>Канал банка HOME:</label><select id='channel'>");
   html += buildChannelOptions(state.channelIndex);
@@ -1243,7 +1425,7 @@ String buildIndexHtml() {
   if (state.highPower) {
     html += " checked";
   }
-  html += "> Мощность 22 dBm (выкл — -5 dBm)</label>";
+  html += "> Мощность " + String(kHighPowerDbm) + " dBm (выкл — " + String(kLowPowerDbm) + " dBm)</label>";
   html += "<label>Фактор расширения:</label><select id='sf'>";
   for (uint8_t sf = 5; sf <= 12; ++sf) {
     html += "<option value='" + String(sf) + "'";
@@ -1303,17 +1485,36 @@ String buildIndexHtml() {
           String(static_cast<unsigned long>(state.implicitPayloadLength)) + "'>";
   html += "<button id='implenApply'>Применить</button></div>";
   html += F("</fieldset>");
+  // Интервал между пакетами
+  html += F("<fieldset><legend>Интервал TX</legend>");
+  html += F("<label>Интервал между пакетами:</label><select id='txInterval'>");
+  const unsigned long currentIv = state.txIntervalMs;
+  const unsigned long opts[4] = {40,80,160,240};
+  for (int i=0;i<4;++i){
+    const unsigned long v = opts[i];
+    html += String("<option value='") + String(v) + "'" + (currentIv==v?" selected":"") + ">" + String(v) + " мс</option>";
+  }
+  html += F("</select>");
+  html += F("</fieldset>");
   html += F("<div class='status' id='status'></div><div class='controls'>");
   html += F("<button id='sendLong'>Отправить длинный пакет 124 байта</button>");
   html += F("<button id='sendRandom'>Отправить полный пакет</button>");
   html += F("<label>Пользовательский пакет (текст):</label><input type='text' id='custom' placeholder='Введите сообщение'>");
   html += F("<button id='sendCustom'>Отправить пользовательский пакет</button>");
+  // Блок пилотов
+  html += F("<fieldset><legend>Пилоты</legend>");
+  html += F("<label>Payload (до 5 байт):</label><input type='text' id='pilotPayload' placeholder='PLT'>");
+  html += F("<label>msgId (0..15):</label><input type='number' id='pilotMsgId' min='0' max='15' value='15'>");
+  html += F("<div style='display:flex;gap:8px;align-items:center;'><button id='pilotStart'>Включить пилоты</button><button id='pilotStop'>Выключить пилоты</button></div>");
+  html += F("</fieldset>");
   html += F("</div></section>");
 
   html += F("<section><h2>Журнал событий</h2><div id='log'></div></section></main><script>");
-  html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfSelect=document.getElementById('sf');const rxboostCb=document.getElementById('rxboost');const fhssCb=document.getElementById('fhss');const symCb=document.getElementById('sym');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const ldroCb=document.getElementById('ldro');const statusEl=document.getElementById('status');let lastId=0;");
-  html += F("function appendLog(entry){const div=document.createElement('div');div.className='message';div.textContent=entry.text;if(entry.color){div.style.color=entry.color;}logEl.appendChild(div);logEl.scrollTop=logEl.scrollHeight;}");
-  html += F("async function refreshLog(){try{const resp=await fetch(`/api/log?after=${lastId}`);if(!resp.ok)return;const data=await resp.json();data.events.forEach(evt=>{appendLog(evt);lastId=evt.id;});}catch(e){console.error(e);}}");
+  html += F("const logEl=document.getElementById('log');const channelSel=document.getElementById('channel');const powerCb=document.getElementById('power');const sfSelect=document.getElementById('sf');const rxboostCb=document.getElementById('rxboost');const fhssCb=document.getElementById('fhss');const symCb=document.getElementById('sym');const interCb=document.getElementById('interleaving');const harqCb=document.getElementById('harq');const phyFecCb=document.getElementById('phyfec');const crc8Cb=document.getElementById('crc8');const ldroCb=document.getElementById('ldro');const statusEl=document.getElementById('status');const rxLed=document.getElementById('rxLed');const txLed=document.getElementById('txLed');const txIntervalSel=document.getElementById('txInterval');let lastId=0;let lastRx=0;let lastTx=0;");
+  html += F("function setLed(el,on,kind){if(on){el.classList.add('on');el.classList.add(kind);}else{el.classList.remove('on');}}");
+  html += F("function updateLeds(){const now=Date.now();setLed(rxLed,now-lastRx<800,'rx');setLed(txLed,now-lastTx<800,'tx');}");
+  html += F("function appendLog(entry){try{const t=entry.text||'';if(t.startsWith('→ ')){lastTx=Date.now();}if(t.startsWith('Принят пакет:')||t.indexOf('IRQ_RX_DONE')>=0){lastRx=Date.now();}if(t.indexOf('IRQ_TX_DONE')>=0){lastTx=Date.now();}}catch(e){}const div=document.createElement('div');div.className='message';div.textContent=entry.text;if(entry.color){div.style.color=entry.color;}logEl.appendChild(div);logEl.scrollTop=logEl.scrollHeight;}");
+  html += F("async function refreshLog(){try{const resp=await fetch(`/api/log?after=${lastId}`);if(!resp.ok)return;const data=await resp.json();data.events.forEach(evt=>{appendLog(evt);lastId=evt.id;});}catch(e){console.error(e);}updateLeds();}");
   html += F("async function postForm(url,body){const resp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(body)});if(!resp.ok){const err=await resp.json().catch(()=>({error:'Неизвестная ошибка'}));throw new Error(err.error||'Ошибка');}}");
   html += F("async function updateProtocol(field,value){const payload={};payload[field]=value?'1':'0';try{await postForm('/api/protocol',payload);statusEl.textContent='Настройки протокола обновлены';refreshLog();}catch(e){statusEl.textContent=e.message;}}");
   html += F("channelSel.addEventListener('change',async()=>{try{await postForm('/api/channel',{channel:channelSel.value});statusEl.textContent='Канал применён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
@@ -1331,7 +1532,10 @@ String buildIndexHtml() {
   html += F("document.getElementById('sendLong').addEventListener('click',async()=>{try{await postForm('/api/send/long',{});statusEl.textContent='Длинный пакет отправлен';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("document.getElementById('sendRandom').addEventListener('click',async()=>{try{await postForm('/api/send/random',{});statusEl.textContent='Полный пакет отправлен';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
   html += F("document.getElementById('sendCustom').addEventListener('click',async()=>{const input=document.getElementById('custom');const payload=input.value;if(!payload.trim()){statusEl.textContent='Введите сообщение';return;}try{await postForm('/api/send/custom',{payload});statusEl.textContent='Пользовательский пакет отправлен';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
-  html += F("setInterval(refreshLog,1500);refreshLog();");
+  html += F("txIntervalSel.addEventListener('change',async()=>{try{await postForm('/api/interval',{ms:txIntervalSel.value});statusEl.textContent='Интервал обновлён';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
+  html += F("document.getElementById('pilotStart').addEventListener('click',async()=>{try{const p=document.getElementById('pilotPayload').value||'';const mid=document.getElementById('pilotMsgId').value||'15';await postForm('/api/pilot',{enable:'1',payload:p,msgId:mid});statusEl.textContent='Пилоты включены';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
+  html += F("document.getElementById('pilotStop').addEventListener('click',async()=>{try{await postForm('/api/pilot',{enable:'0'});statusEl.textContent='Пилоты выключены';refreshLog();}catch(e){statusEl.textContent=e.message;}});");
+  html += F("setInterval(refreshLog,1500);setInterval(updateLeds,200);refreshLog();updateLeds();");
   html += F("</script></body></html>");
   return html;
 }
@@ -1741,20 +1945,6 @@ bool ensureReceiveMode() {
   }
   const unsigned long now = millis();
   state.rxTiming.lastSetRxMs = now;
-
-  bool shouldLog = true;
-  const unsigned long kSetRxLogIntervalMs = (state.fhss.enabled && state.fhss.hopCount > 1U) ? 1000UL : 20UL;
-  if (state.rxTiming.lastSetRxLogMs != 0U) {
-    const unsigned long delta = now - state.rxTiming.lastSetRxLogMs;
-    if (delta < kSetRxLogIntervalMs) {
-      shouldLog = false;
-    }
-  }
-
-  if (shouldLog) {
-    state.rxTiming.lastSetRxLogMs = now;
-    logRxTimingEvent(F("Команда SetRx отправлена (переход в ожидание пакета)"));
-  }
   return true;
 }
 
@@ -1781,11 +1971,19 @@ bool sendPayload(const std::vector<uint8_t>& payload, const String& context) {
   // На время передачи всего сообщения замораживаем FHSS, чтобы частота не менялась
   struct FhssScope { FhssScope(){ fhssSuspend(); } ~FhssScope(){ fhssResume(); } } fhssGuard;
 
+  // Логируем исходный (открытый) текст перед шифрованием
   addEvent(context + ": " + formatByteArray(payload) + " | \"" + formatTextPayload(payload) + "\"");
 
-  const uint16_t crc = crc16Ccitt(payload.data(), payload.size());
+  // Шифруем полезную нагрузку AES-256-CTR: IV(16) + CIPHER
+  std::vector<uint8_t> secured;
+  if (!encryptPayloadAes256(payload, secured)) {
+    addEvent("Ошибка шифрования AES-256 — отправка отменена");
+    return false;
+  }
+
+  const uint16_t crc = crc16Ccitt(secured.data(), secured.size());
   uint16_t announcedParts = 0;
-  auto transportPayload = buildTransportPayloadWithPartMarkers(payload,
+  auto transportPayload = buildTransportPayloadWithPartMarkers(secured,
                                                                state.protocol.payloadCrc8,
                                                                announcedParts);
   addEvent(String("Полезная нагрузка разбита на ") +
@@ -1799,15 +1997,7 @@ bool sendPayload(const std::vector<uint8_t>& payload, const String& context) {
   // Назначаем идентификатор сообщения заранее
   const uint8_t msgId = static_cast<uint8_t>(state.nextMessageId++ & 0x0F);
 
-  // Перед началом окна отправим уникальный START-кадр (для данного msgId),
-  // чтобы приёмник сбросил состояние сборки именно для этого сообщения
-  {
-    auto startFrame = buildStartFrame(msgId);
-    if (!transmitFrame(startFrame, F("START"))) {
-      return false;
-    }
-    waitInterFrameDelay();
-  }
+  // Убрали отправку START-кадра очистки буфера
 
   size_t totalBlocks = blocks.size();
   size_t offset = 0;
@@ -1820,55 +2010,57 @@ bool sendPayload(const std::vector<uint8_t>& payload, const String& context) {
       return false;
     }
 
-    uint16_t missingBitmap = 0;
-    bool needParity = false;
-    if (!waitForAck(windowBaseSeq, windowSize, missingBitmap, needParity)) {
-      addEvent("ACK не получен — считаем потерянным всё окно");
-      missingBitmap = static_cast<uint16_t>((1U << windowSize) - 1U);
-    }
-
-    uint8_t retries = 0;
-    while (missingBitmap != 0 && retries < 3) {
-      const uint8_t missingCount = static_cast<uint8_t>(__builtin_popcount(missingBitmap));
-      addEvent(String("Повторная отправка ") + String(static_cast<unsigned long>(missingCount)) +
-               " пакетов по BITMAP16 0x" + String(missingBitmap, 16));
-      retransmitMissing(blocks, offset, windowBaseSeq, missingBitmap);
+    if (state.protocol.ackEnabled) {
+      uint16_t missingBitmap = 0;
+      bool needParity = false;
       if (!waitForAck(windowBaseSeq, windowSize, missingBitmap, needParity)) {
-        addEvent("ACK после переотправки не пришёл — считаем окно потерянным");
+        addEvent("ACK не получен — считаем потерянным всё окно");
         missingBitmap = static_cast<uint16_t>((1U << windowSize) - 1U);
       }
-      ++retries;
-    }
 
-    if (missingBitmap != 0) {
-      addEvent("Не удалось доставить все DATA-пакеты окна — остановка передачи");
-      return false;
-    }
-
-    if (needParity) {
-      if (state.protocol.harq) {
-        harqUsed = true;
-        addEvent("Получен запрос HARQ: отправляем дополнительный паритет");
-        const ParityPacket parity = computeWindowParity(blocks, offset, windowSize);
-        auto parityFrame = buildDataFrame(static_cast<uint16_t>(windowBaseSeq + windowSize - 1),
-                                          parity.block,
-                                          true,
-                                          true,
-                                          parity.lengthXor);
-        if (!transmitFrame(parityFrame, F("PARITY retry"))) {
-          return false;
-        }
-        waitInterFrameDelay();
+      uint8_t retries = 0;
+      while (missingBitmap != 0 && retries < 3) {
+        const uint8_t missingCount = static_cast<uint8_t>(__builtin_popcount(missingBitmap));
+        addEvent(String("Повторная отправка ") + String(static_cast<unsigned long>(missingCount)) +
+                 " пакетов по BITMAP16 0x" + String(missingBitmap, 16));
+        retransmitMissing(blocks, offset, windowBaseSeq, missingBitmap);
         if (!waitForAck(windowBaseSeq, windowSize, missingBitmap, needParity)) {
-          addEvent("ACK после HARQ не получен — прекращаем передачу окна");
-          return false;
+          addEvent("ACK после переотправки не пришёл — считаем окно потерянным");
+          missingBitmap = static_cast<uint16_t>((1U << windowSize) - 1U);
         }
-        if (missingBitmap != 0) {
-          addEvent("HARQ не помог — окно всё ещё неполное");
-          return false;
+        ++retries;
+      }
+
+      if (missingBitmap != 0) {
+        addEvent("Не удалось доставить все DATA-пакеты окна — остановка передачи");
+        return false;
+      }
+
+      if (needParity) {
+        if (state.protocol.harq) {
+          harqUsed = true;
+          addEvent("Получен запрос HARQ: отправляем дополнительный паритет");
+          const ParityPacket parity = computeWindowParity(blocks, offset, windowSize);
+          auto parityFrame = buildDataFrame(static_cast<uint16_t>(windowBaseSeq + windowSize - 1),
+                                            parity.block,
+                                            state.protocol.ackEnabled,
+                                            true,
+                                            parity.lengthXor);
+          if (!transmitFrame(parityFrame, F("PARITY retry"))) {
+            return false;
+          }
+          waitInterFrameDelay();
+          if (!waitForAck(windowBaseSeq, windowSize, missingBitmap, needParity)) {
+            addEvent("ACK после HARQ не получен — прекращаем передачу окна");
+            return false;
+          }
+          if (missingBitmap != 0) {
+            addEvent("HARQ не помог — окно всё ещё неполное");
+            return false;
+          }
+        } else {
+          addEvent("Получен запрос HARQ, но HARQ отключён");
         }
-      } else {
-        addEvent("Получен запрос HARQ, но HARQ отключён");
       }
     }
 
@@ -1878,7 +2070,7 @@ bool sendPayload(const std::vector<uint8_t>& payload, const String& context) {
 
   state.nextTxSequence = 0;
 
-  auto finFrame = buildFinFrame(static_cast<uint16_t>(payload.size()), crc, harqUsed, msgId);
+  auto finFrame = buildFinFrame(static_cast<uint16_t>(secured.size()), crc, harqUsed, msgId);
   if (!transmitFrame(finFrame, F("FIN"))) {
     return false;
   }
@@ -1920,7 +2112,7 @@ bool sendDataWindow(const std::vector<DataBlock>& blocks,
     if (blockIndex >= blocks.size()) {
       break;
     }
-    const bool ackRequest = (!parityEnabled && idx == windowSize - 1);
+    const bool ackRequest = (state.protocol.ackEnabled && !parityEnabled && idx == windowSize - 1);
     auto frame = buildDataFrame(static_cast<uint16_t>(baseSeq + idx),
                                 blocks[blockIndex],
                                 ackRequest,
@@ -1935,7 +2127,7 @@ bool sendDataWindow(const std::vector<DataBlock>& blocks,
     const ParityPacket parity = computeWindowParity(blocks, offset, windowSize);
     auto parityFrame = buildDataFrame(static_cast<uint16_t>(baseSeq + windowSize - 1),
                                       parity.block,
-                                      true,
+                                      state.protocol.ackEnabled,
                                       true,
                                       parity.lengthXor);
     if (!transmitFrame(parityFrame, F("PARITY"))) {
@@ -2028,11 +2220,8 @@ bool transmitFrame(const std::array<uint8_t, kFixedFrameSize>& frame, const Stri
   }
 
   // Количество повторов передачи (1 или 3)
-  const uint8_t repeats = state.triple.enabledTx ? 3 : 1;
+  const uint8_t repeats = 1; // Повторы отключены
   for (uint8_t i = 0; i < repeats; ++i) {
-    if (i > 0) {
-      addEvent(String("→ повтор ") + String(static_cast<unsigned long>(i + 1)) + "/" + String(static_cast<unsigned long>(repeats)));
-    }
     int16_t result = radio.transmit(const_cast<uint8_t*>(frame.data()), kFixedFrameSize);
     if (result != RADIOLIB_ERR_NONE) {
       logRadioError("transmit", result);
@@ -2057,6 +2246,72 @@ bool transmitFrame(const std::array<uint8_t, kFixedFrameSize>& frame, const Stri
   }
 
   return ensureReceiveMode();
+}
+
+// --- Передача одного кадра без возврата в RX (для «пилотов») ---
+bool transmitFrameTxOnly(const std::array<uint8_t, kFixedFrameSize>& frame, const String& context) {
+  std::vector<uint8_t> bytes(frame.begin(), frame.end());
+  addEvent(String("→ ") + context + ": " + formatByteArray(bytes));
+
+  if (state.fhss.enabled) {
+    advanceFhssIfDue();
+  }
+
+  const bool sameTxRx = (std::fabs(state.currentTxFreq - state.currentRxFreq) < 0.0001f);
+  if (!sameTxRx) {
+    int16_t freqState = radio.setFrequency(state.currentTxFreq);
+    if (freqState != RADIOLIB_ERR_NONE) {
+      logRadioError("setFrequency(TX)", freqState);
+      return false;
+    }
+  }
+
+  int16_t result = radio.transmit(const_cast<uint8_t*>(frame.data()), kFixedFrameSize);
+  if (result != RADIOLIB_ERR_NONE) {
+    logRadioError("transmit", result);
+    (void)radio.setFrequency(state.currentRxFreq);
+    (void)ensureReceiveMode();
+    return false;
+  }
+  // Не возвращаемся в RX намеренно — для максимальной плотности передачи
+  return true;
+}
+
+// --- Фоновая отправка «пилотов» ---
+void pilotTick() {
+  if (!state.pilot.enabled) {
+    return;
+  }
+  const unsigned long now = millis();
+  if (state.pilot.lastTxMs != 0 && (now - state.pilot.lastTxMs) < state.txIntervalMs) {
+    return; // ждём до наступления интервала
+  }
+
+  DataBlock block;
+  block.bytes = state.pilot.payload;
+  block.dataLength = std::min<uint8_t>(state.pilot.length, kFramePayloadSize);
+  const uint16_t seq = composeSeq(state.pilot.msgId, static_cast<uint16_t>(state.pilot.nextPart & kSeqPartMask));
+  auto frame = buildDataFrame(seq, block, /*ackRequest=*/false, /*isParity=*/false, /*parityLengthXor=*/0);
+  if (transmitFrameTxOnly(frame, F("PILOT"))) {
+    state.pilot.nextPart = static_cast<uint16_t>(state.pilot.nextPart + 1);
+    state.pilot.lastTxMs = now;
+  }
+}
+
+// --- Поддержка RX: периодически переинициализируем приём, если давно не было SetRx ---
+void rxKeepAliveTick() {
+  if (state.pilot.enabled) {
+    return; // в режиме пилотов передаём без возврата в RX
+  }
+  const unsigned long now = millis();
+  if (state.rxTiming.lastSetRxMs == 0) {
+    (void)ensureReceiveMode();
+    return;
+  }
+  const unsigned long delta = now - state.rxTiming.lastSetRxMs;
+  if (delta > 1500UL) {
+    (void)ensureReceiveMode();
+  }
 }
 
 // --- Построение DATA-кадра ---
@@ -2240,32 +2495,18 @@ uint8_t crc8Dallas(const uint8_t* data, size_t length) {
 }
 
 // --- Пауза между кадрами ---
+// Убраны все межкадровые задержки для максимально плотной передачи
 void waitInterFrameDelay() {
+  const unsigned long ms = state.txIntervalMs;
 #if defined(ARDUINO)
-  delay(computeInterFrameDelayMs());
+  if (ms > 0) { delay(ms); }
 #else
-  std::this_thread::sleep_for(std::chrono::milliseconds(computeInterFrameDelayMs()));
+  if (ms > 0) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 #endif
 }
 
 // --- Динамический расчёт паузы между кадрами ---
-unsigned long computeInterFrameDelayMs() {
-  const float airtime = estimateLoRaAirTimeMs(static_cast<uint8_t>(kFixedFrameSize),
-                                             state.rxTiming.preambleSymbols);
-  if (!std::isfinite(airtime) || airtime <= 0.0f) {
-    return kInterFrameDelayMs;
-  }
-
-  const bool highSf = (state.currentSpreadingFactor >= 8);
-  const unsigned long minDelay = highSf ? 8UL : 3UL;
-  const unsigned long maxDelay = highSf ? 16UL : kInterFrameDelayMs;
-  const unsigned long guard = static_cast<unsigned long>(std::ceil(airtime * 0.12f));
-  unsigned long delayMs = std::max<unsigned long>(guard, minDelay);
-  if (state.rxWindow.lastAckRttMs > 0) {
-    delayMs = std::max<unsigned long>(delayMs, state.rxWindow.lastAckRttMs / 12U + 1U);
-  }
-  return std::clamp<unsigned long>(delayMs, minDelay, maxDelay);
-}
+unsigned long computeInterFrameDelayMs() { return state.txIntervalMs; }
 
 // --- Небольшая пауза перед отправкой ACK, чтобы удалённая сторона успела переключиться в RX ---
 unsigned long computeAckTurnaroundDelayMs() {
@@ -2406,8 +2647,17 @@ String formatWindowReceptionStatus(uint16_t receivedMask, uint8_t windowSize) {
 
 // --- Логирование принятого сообщения ---
 void logReceivedMessage(const std::vector<uint8_t>& payload) {
-  addEvent(String("Принято сообщение (") + String(static_cast<unsigned long>(payload.size())) + " байт): " +
-           formatByteArray(payload) + " | \"" + formatTextPayload(payload) + "\"", kIncomingColor);
+  std::vector<uint8_t> plain;
+  bool decrypted = decryptPayloadAes256(payload, plain);
+  if (decrypted) {
+    addEvent(String("Принято зашифрованное сообщение (") +
+             String(static_cast<unsigned long>(payload.size())) + " байт, расш.=\"" +
+             formatTextPayload(plain) + "\"", kIncomingColor);
+  } else {
+    // fallback: показываем как есть
+    addEvent(String("Принято сообщение (") + String(static_cast<unsigned long>(payload.size())) + " байт): " +
+             formatByteArray(payload) + " | \"" + formatTextPayload(payload) + "\"", kIncomingColor);
+  }
 }
 
 // --- Полный сброс состояния приёмника ---
@@ -2533,6 +2783,11 @@ void processIncomingDataFrame(const std::vector<uint8_t>& frame) {
 
   const uint8_t flags = frame[0] & static_cast<uint8_t>(~kFrameTypeMask);
   const uint16_t seq = static_cast<uint16_t>(frame[1]) | (static_cast<uint16_t>(frame[2]) << 8);
+  // Если это кадры "пилотов" (идут без FIN), не накапливаем их в сборке,
+  // чтобы не разрастался буфер и не блокировался приём
+  if (extractMsgId(seq) == state.pilot.msgId && state.pilot.msgId <= 0x0F) {
+    return;
+  }
   const uint8_t lengthField = static_cast<uint8_t>((flags & kDataFlagLengthMask) >> kDataFlagLengthShift);
   const bool ackRequest = (flags & kDataFlagAckRequest) != 0;
   const bool isParity = (flags & kDataFlagIsParity) != 0;
@@ -2650,6 +2905,9 @@ void processIncomingDataFrame(const std::vector<uint8_t>& frame) {
 
 // --- Обработка ACK-кадра ---
 void processIncomingAckFrame(const std::vector<uint8_t>& frame) {
+  if (!state.protocol.ackEnabled) {
+    return; // ACK отключён — игнорируем кадр
+  }
   if (frame.size() < 6) {
     addEvent("Получен усечённый ACK");
     return;
@@ -2696,6 +2954,10 @@ void processIncomingParityFrame(uint16_t seq,
                                 const std::vector<uint8_t>& frame) {
   if (frame.size() < 3) {
     addEvent("Получен усечённый PAR-кадр");
+    return;
+  }
+  // Игнорируем паритет для потока "пилотов"
+  if (extractMsgId(seq) == state.pilot.msgId && state.pilot.msgId <= 0x0F) {
     return;
   }
   const uint8_t msgId = extractMsgId(seq);
@@ -2819,6 +3081,9 @@ void processIncomingFinFrame(const std::vector<uint8_t>& frame) {
 
 // --- Подготовка и отправка ACK ---
 void prepareAckFor(PerMessageRx& pm, uint16_t /*seq*/, uint8_t windowSize, bool forceSend) {
+  if (!state.protocol.ackEnabled) {
+    return; // ACK отключён — не формируем и не отправляем
+  }
   if (!pm.win.active) {
     return;
   }
